@@ -192,7 +192,17 @@ impl<'a> ChatRequestBuilder<'a> {
                         json!(text)
                     };
 
-                    let mut msg = json!({"role": role, "content": content_value});
+                    // Chat Completions API accepts only `system | user | assistant | tool`.
+                    // codex internally emits a `developer` role for prompt-style
+                    // instructions (OpenAI's Responses API extension); map it to
+                    // `system` so Chat-only providers (DeepSeek, etc.) accept it.
+                    // Pre-existing `latest_reminder` (another codex-internal role)
+                    // is similarly downgraded.
+                    let wire_role = match role.as_str() {
+                        "developer" | "latest_reminder" => "system",
+                        other => other,
+                    };
+                    let mut msg = json!({"role": wire_role, "content": content_value});
                     if role == "assistant"
                         && let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
