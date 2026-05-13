@@ -30,7 +30,10 @@ pub(crate) fn spawn_chat_stream(
     tokio::spawn(async move {
         process_chat_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
-    ResponseStream { rx_event }
+    ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
 }
 
 /// Processes Server-Sent Events from the legacy Chat Completions streaming API.
@@ -96,6 +99,7 @@ pub async fn process_chat_sse<S>(
             .send(Ok(ResponseEvent::Completed {
                 response_id: String::new(),
                 token_usage: None,
+                end_turn: None,
             }))
             .await;
     }
@@ -274,6 +278,7 @@ pub async fn process_chat_sse<S>(
                         .send(Ok(ResponseEvent::Completed {
                             response_id: String::new(),
                             token_usage: None,
+                            end_turn: None,
                         }))
                         .await;
                     completed_sent = true;
@@ -310,6 +315,7 @@ pub async fn process_chat_sse<S>(
                     let item = ResponseItem::FunctionCall {
                         id: None,
                         name,
+                        namespace: None,
                         arguments,
                         call_id: id.unwrap_or_else(|| format!("tool-call-{index}")),
                     };
@@ -330,7 +336,6 @@ async fn append_assistant_text(
             id: None,
             role: "assistant".to_string(),
             content: vec![],
-            end_turn: None,
             phase: None,
         };
         *assistant_item = Some(item.clone());

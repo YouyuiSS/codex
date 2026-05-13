@@ -1,6 +1,6 @@
 use crate::error::ApiError;
 use crate::provider::Provider;
-use crate::requests::headers::build_conversation_headers;
+use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
 use codex_protocol::models::ContentItem;
@@ -73,8 +73,11 @@ impl<'a> ChatRequestBuilder<'a> {
                 ResponseItem::CustomToolCall { .. } => {}
                 ResponseItem::CustomToolCallOutput { .. } => {}
                 ResponseItem::WebSearchCall { .. } => {}
-                ResponseItem::GhostSnapshot { .. } => {}
                 ResponseItem::Compaction { .. } => {}
+                ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::ToolSearchOutput { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+                | ResponseItem::ContextCompaction { .. } => {}
             }
         }
 
@@ -163,7 +166,7 @@ impl<'a> ChatRequestBuilder<'a> {
                                 text.push_str(t);
                                 items.push(json!({"type":"text","text": t}));
                             }
-                            ContentItem::InputImage { image_url } => {
+                            ContentItem::InputImage { image_url, .. } => {
                                 saw_image = true;
                                 items.push(
                                     json!({"type":"image_url","image_url": {"url": image_url}}),
@@ -231,21 +234,25 @@ impl<'a> ChatRequestBuilder<'a> {
                     push_tool_call_message(&mut messages, tool_call, reasoning);
                 }
                 ResponseItem::FunctionCallOutput { call_id, output } => {
-                    let content_value = if let Some(items) = &output.content_items {
+                    // codex-tea drift: FunctionCallOutputPayload now exposes
+                    // content_items() as a method and stores text in body.
+                    let content_value = if let Some(items) = output.content_items() {
                         let mapped: Vec<Value> = items
                             .iter()
                             .map(|it| match it {
                                 FunctionCallOutputContentItem::InputText { text } => {
                                     json!({"type":"text","text": text})
                                 }
-                                FunctionCallOutputContentItem::InputImage { image_url } => {
+                                FunctionCallOutputContentItem::InputImage { image_url, .. } => {
                                     json!({"type":"image_url","image_url": {"url": image_url}})
                                 }
                             })
                             .collect();
                         json!(mapped)
                     } else {
-                        json!(output.content)
+                        // FunctionCallOutputPayload has a custom Serialize that
+                        // produces a plain JSON string when body is Text.
+                        json!(output)
                     };
 
                     messages.push(json!({
@@ -272,20 +279,21 @@ impl<'a> ChatRequestBuilder<'a> {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
                     push_tool_call_message(&mut messages, tool_call, reasoning);
                 }
-                ResponseItem::CustomToolCallOutput { call_id, output } => {
+                ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": output,
                     }));
                 }
-                ResponseItem::GhostSnapshot { .. } => {
-                    continue;
-                }
                 ResponseItem::Reasoning { .. }
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Other
-                | ResponseItem::Compaction { .. } => {
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::ToolSearchOutput { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+                | ResponseItem::ContextCompaction { .. } => {
                     continue;
                 }
             }
@@ -298,7 +306,10 @@ impl<'a> ChatRequestBuilder<'a> {
             "tools": self.tools,
         });
 
-        let mut headers = build_conversation_headers(self.conversation_id);
+        // Map upstream's single conversation_id onto codex-tea's renamed
+        // build_session_headers(session_id, thread_id). The chat path doesn't
+        // carry a thread_id yet, so we use conversation_id as session_id.
+        let mut headers = build_session_headers(self.conversation_id, None);
         if let Some(subagent) = subagent_header(&self.session_source) {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
