@@ -1,6 +1,7 @@
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
+use crate::provider::ChatDialect;
 use crate::telemetry::SseTelemetry;
 use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
@@ -25,10 +26,11 @@ pub(crate) fn spawn_chat_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     _turn_state: Option<Arc<OnceLock<String>>>,
+    dialect: ChatDialect,
 ) -> ResponseStream {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
-        process_chat_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
+        process_chat_sse(stream_response.bytes, tx_event, idle_timeout, telemetry, dialect).await;
     });
     ResponseStream {
         rx_event,
@@ -56,6 +58,7 @@ pub async fn process_chat_sse<S>(
     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
     idle_timeout: Duration,
     telemetry: Option<std::sync::Arc<dyn SseTelemetry>>,
+    dialect: ChatDialect,
 ) where
     S: Stream<Item = Result<bytes::Bytes, codex_client::TransportError>> + Unpin,
 {
@@ -156,22 +159,34 @@ pub async fn process_chat_sse<S>(
             }
         };
 
+        // 诊断开关：设置 TEA_CHAT_SSE_TRACE=1 时把每条 SSE 原始 JSON 打到 stderr
+        // （sidecar 日志），用于排查 provider 实际推了哪些 delta 字段。
+        if std::env::var_os("TEA_CHAT_SSE_TRACE").is_some() {
+            eprintln!("[chat-sse-trace] {data}");
+        }
+
         let Some(choices) = value.get("choices").and_then(|c| c.as_array()) else {
             continue;
         };
 
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                if let Some(reasoning) = delta.get("reasoning") {
-                    if let Some(text) = reasoning.as_str() {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                // 推理字段按方言取：OpenAI 原生 Chat Completions 不发 reasoning，
+                // 严格标准下不读。野鸡 thinking 模式（DeepSeek/GLM/Qwen）发
+                // `delta.reasoning_content` 字符串，原样累加进 reasoning_item。
+                // 新方言加进来时，在这里加一条分支。
+                match dialect {
+                    ChatDialect::Strict => {}
+                    ChatDialect::ThinkingReasoningContent => {
+                        if let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str())
+                        {
+                            append_reasoning_text(
+                                &tx_event,
+                                &mut reasoning_item,
+                                text.to_string(),
+                            )
                             .await;
-                    } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
-                            .await;
-                    } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
-                        append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
-                            .await;
+                        }
                     }
                 }
 
@@ -179,6 +194,9 @@ pub async fn process_chat_sse<S>(
                     if content.is_array() {
                         for item in content.as_array().unwrap_or(&vec![]) {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                if text.is_empty() {
+                                    continue;
+                                }
                                 append_assistant_text(
                                     &tx_event,
                                     &mut assistant_item,
@@ -188,6 +206,20 @@ pub async fn process_chat_sse<S>(
                             }
                         }
                     } else if let Some(text) = content.as_str() {
+                        // **核心防线**：DeepSeek / 部分 OpenAI-compat provider 在 thinking
+                        // 模式下会推 `delta.content = ""`（空字符串）作为开场或在
+                        // reasoning_content 间隔里。这种空 chunk 没有任何信息，但如果
+                        // 进了 append_assistant_text 就会**创建 assistant_item 并装一个
+                        // 空 OutputText**。后续若没有真正的文字 delta，assistant_item
+                        // 仍然以"一个空 chunk"的状态被 flush 出去 → 进 rollout 成为
+                        // `Message{content:[OutputText{""}]}` → 下一轮 chat.rs 投影成
+                        // `{role:assistant, content:""}` → DeepSeek thinking 模式硬拒绝
+                        // "The reasoning_content in the thinking mode must be passed back"。
+                        //
+                        // 入口级 hygiene：空 text 不创建/不追加。
+                        if text.is_empty() {
+                            continue;
+                        }
                         append_assistant_text(&tx_event, &mut assistant_item, text.to_string())
                             .await;
                     }
@@ -248,15 +280,22 @@ pub async fn process_chat_sse<S>(
                 }
             }
 
-            if let Some(message) = choice.get("message")
-                && let Some(reasoning) = message.get("reasoning")
-            {
-                if let Some(text) = reasoning.as_str() {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("text").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
-                } else if let Some(text) = reasoning.get("content").and_then(|v| v.as_str()) {
-                    append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string()).await;
+            // 非流式（一次性返回）也按方言取 reasoning。
+            if let Some(message) = choice.get("message") {
+                match dialect {
+                    ChatDialect::Strict => {}
+                    ChatDialect::ThinkingReasoningContent => {
+                        if let Some(text) =
+                            message.get("reasoning_content").and_then(|v| v.as_str())
+                        {
+                            append_reasoning_text(
+                                &tx_event,
+                                &mut reasoning_item,
+                                text.to_string(),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
 
@@ -332,8 +371,22 @@ async fn append_assistant_text(
     text: String,
 ) {
     if assistant_item.is_none() {
+        // **关键**：必须分配稳定 uuid，不能 id: None。
+        //
+        // OutputItemAdded 用对象的快照（clone）emit，此时 content 还是空；流式
+        // deltas 写入持有的 assistant_item 引用；flush 时 OutputItemDone emit
+        // take 出来的最终对象（content 完整）。
+        //
+        // 如果 id 是 None，下游（app-server）翻译 ResponseItem -> ThreadItem
+        // 时会**给每次 emit 都新生成 uuid**，导致 Added 和 Done 走出不同的
+        // itemId：
+        //   - UI 看到两个 item id → 渲染两张同一条消息的卡片（一张空+一张完整）
+        //   - 持久化（rollout）保留两份 Message ResponseItem，下一轮 chat.rs 序列化
+        //     时把空那份当成"空 assistant message"发回 provider，DeepSeek thinking
+        //     模式硬拒绝 ("reasoning_content must be passed back to the API")
+        let item_id = uuid::Uuid::new_v4().to_string();
         let item = ResponseItem::Message {
-            id: None,
+            id: Some(item_id),
             role: "assistant".to_string(),
             content: vec![],
             phase: None,
@@ -358,8 +411,11 @@ async fn append_reasoning_text(
     text: String,
 ) {
     if reasoning_item.is_none() {
+        // 同 append_assistant_text 的注释：必须分配稳定 uuid。Reasoning.id 在
+        // codex-protocol 是 String（非 Option），upstream 习惯空串占位，我们
+        // 这里给真 uuid 以保证 Added/Done 用同一 id。
         let item = ResponseItem::Reasoning {
-            id: String::new(),
+            id: uuid::Uuid::new_v4().to_string(),
             summary: Vec::new(),
             content: Some(vec![]),
             encrypted_content: None,
@@ -424,6 +480,7 @@ mod tests {
             tx,
             Duration::from_millis(1000),
             None,
+            ChatDialect::Strict,
         ));
 
         let mut out = Vec::new();

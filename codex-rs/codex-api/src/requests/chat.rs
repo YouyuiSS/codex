@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use crate::provider::ChatDialect;
 use crate::provider::Provider;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
@@ -55,7 +56,15 @@ impl<'a> ChatRequestBuilder<'a> {
         self
     }
 
-    pub fn build(self, _provider: &Provider) -> Result<ChatRequest, ApiError> {
+    pub fn build(self, provider: &Provider) -> Result<ChatRequest, ApiError> {
+        // 推理字段按方言决定。OpenAI 原生 Chat Completions 没有 reasoning 字段
+        // → None，请求里不写。野鸡 thinking 模式（DeepSeek/GLM/Qwen 等）→
+        // `reasoning_content`，下一轮请求必须把上一轮 sidecar 收到的推理原样
+        // 回传，否则服务端硬校验拒收。新增方言时在这里加一条 match 分支。
+        let reasoning_field: Option<&'static str> = match provider.chat_dialect {
+            ChatDialect::Strict => None,
+            ChatDialect::ThinkingReasoningContent => Some("reasoning_content"),
+        };
         let mut messages = Vec::<Value>::new();
         messages.push(json!({"role": "system", "content": self.instructions}));
 
@@ -176,6 +185,16 @@ impl<'a> ChatRequestBuilder<'a> {
                     }
 
                     if role == "assistant" {
+                        // 跳过空 assistant message：chat-wire 路径下 sse/chat.rs 的
+                        // streaming 实现会在某些 turn 中持久化出 content=[] 的
+                        // ResponseItem::Message（比如只有 reasoning + tool_call、
+                        // 没有最终文字答复的 turn），下一轮请求 chat.rs 会把它投影成
+                        // `{"role":"assistant","content":""}`。这种空壳消息对 DeepSeek
+                        // 等 thinking-mode provider 是硬拒绝（没 reasoning_content 字段），
+                        // 对 OpenAI 也是冗余无用 —— 直接丢。
+                        if text.is_empty() && !saw_image {
+                            continue;
+                        }
                         if let Some(prev) = &last_assistant_text
                             && prev == &text
                         {
@@ -204,10 +223,11 @@ impl<'a> ChatRequestBuilder<'a> {
                     };
                     let mut msg = json!({"role": wire_role, "content": content_value});
                     if role == "assistant"
+                        && let Some(field) = reasoning_field
                         && let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
-                        obj.insert("reasoning".to_string(), json!(reasoning));
+                        obj.insert(field.to_string(), json!(reasoning));
                     }
                     messages.push(msg);
                 }
@@ -226,7 +246,7 @@ impl<'a> ChatRequestBuilder<'a> {
                             "arguments": arguments,
                         }
                     });
-                    push_tool_call_message(&mut messages, tool_call, reasoning);
+                    push_tool_call_message(&mut messages, tool_call, reasoning, reasoning_field);
                 }
                 ResponseItem::LocalShellCall {
                     id,
@@ -241,7 +261,7 @@ impl<'a> ChatRequestBuilder<'a> {
                         "status": status,
                         "action": action,
                     });
-                    push_tool_call_message(&mut messages, tool_call, reasoning);
+                    push_tool_call_message(&mut messages, tool_call, reasoning, reasoning_field);
                 }
                 ResponseItem::FunctionCallOutput { call_id, output } => {
                     // codex-tea drift: FunctionCallOutputPayload now exposes
@@ -287,7 +307,7 @@ impl<'a> ChatRequestBuilder<'a> {
                         }
                     });
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
-                    push_tool_call_message(&mut messages, tool_call, reasoning);
+                    push_tool_call_message(&mut messages, tool_call, reasoning, reasoning_field);
                 }
                 ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
                     messages.push(json!({
@@ -316,6 +336,15 @@ impl<'a> ChatRequestBuilder<'a> {
             "tools": self.tools,
         });
 
+        // 诊断开关：设置 TEA_CHAT_REQ_TRACE=1 时把出站请求 body 打到 stderr，
+        // 用于排查 messages 列表里 reasoning_content 字段实际形态。
+        if std::env::var_os("TEA_CHAT_REQ_TRACE").is_some() {
+            eprintln!(
+                "[chat-req-trace] {}",
+                serde_json::to_string(&payload).unwrap_or_default()
+            );
+        }
+
         // Map upstream's single conversation_id onto codex-tea's renamed
         // build_session_headers(session_id, thread_id). The chat path doesn't
         // carry a thread_id yet, so we use conversation_id as session_id.
@@ -331,26 +360,32 @@ impl<'a> ChatRequestBuilder<'a> {
     }
 }
 
-fn push_tool_call_message(messages: &mut Vec<Value>, tool_call: Value, reasoning: Option<&str>) {
+fn push_tool_call_message(
+    messages: &mut Vec<Value>,
+    tool_call: Value,
+    reasoning: Option<&str>,
+    reasoning_field: Option<&str>,
+) {
     // Chat Completions requires that tool calls are grouped into a single assistant message
     // (with `tool_calls: [...]`) followed by tool role responses.
+    //
+    // 推理字段名按调用方传入的方言决定（OpenAI Strict = None 不写；DeepSeek 等
+    // ThinkingReasoningContent = "reasoning_content"）。统一从 reasoning_field
+    // 进，避免方言耦合到这个 helper 内部。
     if let Some(Value::Object(obj)) = messages.last_mut()
         && obj.get("role").and_then(Value::as_str) == Some("assistant")
         && obj.get("content").is_some_and(Value::is_null)
         && let Some(tool_calls) = obj.get_mut("tool_calls").and_then(Value::as_array_mut)
     {
         tool_calls.push(tool_call);
-        if let Some(reasoning) = reasoning {
-            if let Some(Value::String(existing)) = obj.get_mut("reasoning") {
+        if let (Some(reasoning), Some(field)) = (reasoning, reasoning_field) {
+            if let Some(Value::String(existing)) = obj.get_mut(field) {
                 if !existing.is_empty() {
                     existing.push('\n');
                 }
                 existing.push_str(reasoning);
             } else {
-                obj.insert(
-                    "reasoning".to_string(),
-                    Value::String(reasoning.to_string()),
-                );
+                obj.insert(field.to_string(), Value::String(reasoning.to_string()));
             }
         }
         return;
@@ -361,10 +396,10 @@ fn push_tool_call_message(messages: &mut Vec<Value>, tool_call: Value, reasoning
         "content": null,
         "tool_calls": [tool_call],
     });
-    if let Some(reasoning) = reasoning
+    if let (Some(reasoning), Some(field)) = (reasoning, reasoning_field)
         && let Some(obj) = msg.as_object_mut()
     {
-        obj.insert("reasoning".to_string(), json!(reasoning));
+        obj.insert(field.to_string(), json!(reasoning));
     }
     messages.push(msg);
 }

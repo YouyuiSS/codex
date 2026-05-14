@@ -77,11 +77,13 @@ impl<T: HttpTransport> ChatClient<T> {
             )
             .await?;
 
+        let provider = self.session.provider();
         Ok(spawn_chat_stream(
             stream_response,
-            self.session.provider().stream_idle_timeout,
+            provider.stream_idle_timeout,
             self.sse_telemetry.clone(),
             None,
+            provider.chat_dialect,
         ))
     }
 }
