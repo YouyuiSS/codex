@@ -66,6 +66,7 @@ struct SummarizeResponse {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::ChatDialect;
     use super::*;
     use crate::auth::AuthProvider;
     use crate::common::RawMemory;
@@ -152,6 +153,7 @@ mod tests {
                 retry_transport: true,
             },
             stream_idle_timeout: Duration::from_secs(1),
+            chat_dialect: ChatDialect::Strict,
         }
     }
 

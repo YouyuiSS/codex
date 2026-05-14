@@ -184,6 +184,10 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
+        // Remote thread config 协议（codex backend → codex-rs）当前还没
+        // 携带方言字段；缺省 Strict 即可，桌面端通过 config.toml 注入的
+        // model_providers 才是 thinking provider 的源头。
+        openai_chat_dialect: Default::default(),
     };
     Ok((id, info))
 }

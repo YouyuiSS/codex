@@ -5,6 +5,7 @@
 //!   2. User-defined entries inside `~/.codex/config.toml` under the `model_providers`
 //!      key. These override or extend the defaults at runtime.
 
+use codex_api::ChatDialect as ApiChatDialect;
 use codex_api::Provider as ApiProvider;
 use codex_api::RetryConfig as ApiRetryConfig;
 use codex_api::is_azure_responses_provider;
@@ -57,6 +58,31 @@ pub enum WireApi {
     /// Revived from upstream pre-d2394a2494 for compatibility with providers
     /// that don't speak the Responses protocol (DeepSeek, Anthropic, etc).
     Chat,
+}
+
+/// OpenAI Chat Completions 的方言。
+///
+/// 设计基线：**OpenAI 原生 Chat Completions 是规范**。野鸡 OpenAI-compat
+/// provider（DeepSeek v4 thinking、GLM-4.5、Qwen3-thinking …）在标准外加字段
+/// 时，在这里枚举一种 dialect，并在 chat-wire 模块的 in / out 边界
+/// `match dialect` 加一条分支。**不抽 trait / 插件框架**，差异爆炸再说。
+///
+/// 这是个 codex-tea 自维护字段，跟 upstream `ModelProviderInfo` 演进解耦
+/// （`#[serde(default)]` 保证 upstream 不写该字段也能反序列化）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiChatDialect {
+    /// OpenAI 原生 Chat Completions。严格标准：不读不写 reasoning_content /
+    /// reasoning 等 OpenAI 标准外的字段。
+    #[default]
+    Strict,
+    /// OpenAI-compatible thinking 模式（DeepSeek v4 thinking、GLM-4.5、
+    /// Qwen3-thinking 等）：
+    ///   - 流式 SSE 推 `delta.reasoning_content`；
+    ///   - 下一轮 assistant message 必须原样回传 `reasoning_content` 字段，
+    ///     否则服务端会硬校验拒收（DeepSeek 实测："The `reasoning_content`
+    ///     in the thinking mode must be passed back to the API."）。
+    ThinkingReasoningContent,
 }
 
 impl fmt::Display for WireApi {
@@ -138,6 +164,14 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+
+    /// codex-tea: 选定 OpenAI Chat Completions 方言。仅当 `wire_api == Chat`
+    /// 时由 chat-wire 模块消费；`Responses` 路径忽略此字段。
+    ///
+    /// 默认 `Strict`（OpenAI 原生）。Tea 桌面端在注入 model_providers 时按
+    /// provider 类型显式设置（DeepSeek/GLM/Qwen 设为 `ThinkingReasoningContent`）。
+    #[serde(default)]
+    pub openai_chat_dialect: OpenAiChatDialect,
 }
 
 /// AWS SigV4 auth configuration for a model provider.
@@ -268,6 +302,12 @@ impl ModelProviderInfo {
             headers,
             retry,
             stream_idle_timeout: self.stream_idle_timeout(),
+            chat_dialect: match self.openai_chat_dialect {
+                OpenAiChatDialect::Strict => ApiChatDialect::Strict,
+                OpenAiChatDialect::ThinkingReasoningContent => {
+                    ApiChatDialect::ThinkingReasoningContent
+                }
+            },
         })
     }
 
@@ -354,6 +394,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: true,
             supports_websockets: true,
+            openai_chat_dialect: OpenAiChatDialect::Strict,
         }
     }
 
@@ -384,6 +425,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            openai_chat_dialect: OpenAiChatDialect::Strict,
         }
     }
 
@@ -515,6 +557,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        openai_chat_dialect: OpenAiChatDialect::Strict,
     }
 }
 

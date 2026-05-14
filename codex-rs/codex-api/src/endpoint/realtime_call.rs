@@ -220,6 +220,7 @@ fn decode_call_id_from_location(headers: &HeaderMap) -> Result<String, ApiError>
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::ChatDialect;
     use super::*;
     use crate::auth::AuthProvider;
     use crate::endpoint::realtime_websocket::RealtimeEventParser;
@@ -307,6 +308,7 @@ mod tests {
                 retry_transport: true,
             },
             stream_idle_timeout: Duration::from_secs(1),
+            chat_dialect: ChatDialect::Strict,
         }
     }
 

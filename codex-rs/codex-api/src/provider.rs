@@ -35,6 +35,19 @@ impl RetryConfig {
     }
 }
 
+/// Chat Completions 方言。codex-api 内部使用；由上层（codex-tea
+/// `model-provider-info::OpenAiChatDialect`）翻译进来。
+///
+/// 默认 `Strict` = OpenAI 原生 Chat Completions。野鸡 OpenAI-compat provider
+/// 在标准外加字段时（如 DeepSeek/GLM/Qwen 的 thinking `reasoning_content`），
+/// 通过这个枚举把分支处理塞进 chat-wire 边界，避免污染核心代码。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatDialect {
+    #[default]
+    Strict,
+    ThinkingReasoningContent,
+}
+
 /// HTTP endpoint configuration used to talk to a concrete API deployment.
 ///
 /// Encapsulates base URL, default headers, query params, retry policy, and
@@ -47,6 +60,8 @@ pub struct Provider {
     pub headers: HeaderMap,
     pub retry: RetryConfig,
     pub stream_idle_timeout: Duration,
+    /// Chat Completions 方言。仅当 chat-wire 路径用，Responses 路径忽略。
+    pub chat_dialect: ChatDialect,
 }
 
 impl Provider {
