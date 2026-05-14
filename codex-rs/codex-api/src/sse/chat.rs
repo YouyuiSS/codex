@@ -194,9 +194,6 @@ pub async fn process_chat_sse<S>(
                     if content.is_array() {
                         for item in content.as_array().unwrap_or(&vec![]) {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                if text.is_empty() {
-                                    continue;
-                                }
                                 append_assistant_text(
                                     &tx_event,
                                     &mut assistant_item,
@@ -206,20 +203,6 @@ pub async fn process_chat_sse<S>(
                             }
                         }
                     } else if let Some(text) = content.as_str() {
-                        // **核心防线**：DeepSeek / 部分 OpenAI-compat provider 在 thinking
-                        // 模式下会推 `delta.content = ""`（空字符串）作为开场或在
-                        // reasoning_content 间隔里。这种空 chunk 没有任何信息，但如果
-                        // 进了 append_assistant_text 就会**创建 assistant_item 并装一个
-                        // 空 OutputText**。后续若没有真正的文字 delta，assistant_item
-                        // 仍然以"一个空 chunk"的状态被 flush 出去 → 进 rollout 成为
-                        // `Message{content:[OutputText{""}]}` → 下一轮 chat.rs 投影成
-                        // `{role:assistant, content:""}` → DeepSeek thinking 模式硬拒绝
-                        // "The reasoning_content in the thinking mode must be passed back"。
-                        //
-                        // 入口级 hygiene：空 text 不创建/不追加。
-                        if text.is_empty() {
-                            continue;
-                        }
                         append_assistant_text(&tx_event, &mut assistant_item, text.to_string())
                             .await;
                     }

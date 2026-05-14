@@ -185,16 +185,6 @@ impl<'a> ChatRequestBuilder<'a> {
                     }
 
                     if role == "assistant" {
-                        // 跳过空 assistant message：chat-wire 路径下 sse/chat.rs 的
-                        // streaming 实现会在某些 turn 中持久化出 content=[] 的
-                        // ResponseItem::Message（比如只有 reasoning + tool_call、
-                        // 没有最终文字答复的 turn），下一轮请求 chat.rs 会把它投影成
-                        // `{"role":"assistant","content":""}`。这种空壳消息对 DeepSeek
-                        // 等 thinking-mode provider 是硬拒绝（没 reasoning_content 字段），
-                        // 对 OpenAI 也是冗余无用 —— 直接丢。
-                        if text.is_empty() && !saw_image {
-                            continue;
-                        }
                         if let Some(prev) = &last_assistant_text
                             && prev == &text
                         {
