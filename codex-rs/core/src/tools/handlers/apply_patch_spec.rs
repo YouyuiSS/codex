@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark");
@@ -23,6 +27,105 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
             syntax: "lark".to_string(),
             definition,
         },
+    })
+}
+
+/// JSON 变体的 apply_patch 工具描述。直接 backport 自 upstream codex
+/// `tools/src/apply_patch_tool.rs:APPLY_PATCH_JSON_TOOL_DESCRIPTION`，
+/// 给 chat-compatible providers (DeepSeek/GLM/Qwen 等) 用：它们不支持
+/// OpenAI Responses API 的 grammar-constrained custom tool，只能走标准
+/// `type: function` + JSON schema args。
+const APPLY_PATCH_JSON_TOOL_DESCRIPTION: &str = r#"Use the `apply_patch` tool to edit files.
+Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
+
+*** Begin Patch
+[ one or more file sections ]
+*** End Patch
+
+Within that envelope, you get a sequence of file operations.
+You MUST include a header to specify the action you are taking.
+Each operation starts with one of three headers:
+
+*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
+*** Delete File: <path> - remove an existing file. Nothing follows.
+*** Update File: <path> - patch an existing file in place (optionally with a rename).
+
+May be immediately followed by *** Move to: <new path> if you want to rename the file.
+Then one or more “hunks”, each introduced by @@ (optionally followed by a hunk header).
+Within a hunk each line starts with:
+
+For instructions on [context_before] and [context_after]:
+- By default, show 3 lines of code immediately above and 3 lines immediately below each change. If a change is within 3 lines of a previous change, do NOT duplicate the first change’s [context_after] lines in the second change’s [context_before] lines.
+- If 3 lines of context is insufficient to uniquely identify the snippet of code within the file, use the @@ operator to indicate the class or function to which the snippet belongs. For instance, we might have:
+@@ class BaseClass
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+- If a code block is repeated so many times in a class or function such that even a single `@@` statement and 3 lines of context cannot uniquely identify the snippet of code, you can use multiple `@@` statements to jump to the right context. For instance:
+
+@@ class BaseClass
+@@ 	 def method():
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+The full grammar definition is below:
+Patch := Begin { FileOp } End
+Begin := "*** Begin Patch" NEWLINE
+End := "*** End Patch" NEWLINE
+FileOp := AddFile | DeleteFile | UpdateFile
+AddFile := "*** Add File: " path NEWLINE { "+" line NEWLINE }
+DeleteFile := "*** Delete File: " path NEWLINE
+UpdateFile := "*** Update File: " path NEWLINE [ MoveTo ] { Hunk }
+MoveTo := "*** Move to: " newPath NEWLINE
+Hunk := "@@" [ header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
+HunkLine := (" " | "-" | "+") text NEWLINE
+
+A full patch can combine several operations:
+
+*** Begin Patch
+*** Add File: hello.txt
++Hello world
+*** Update File: src/app.py
+*** Move to: src/main.py
+@@ def greet():
+-print("Hi")
++print("Hello, world!")
+*** Delete File: obsolete.txt
+*** End Patch
+
+It is important to remember:
+
+- You must include a header with your intended action (Add/Delete/Update)
+- You must prefix new lines with `+` even when creating a new file
+- File references can only be relative, NEVER ABSOLUTE.
+"#;
+
+/// JSON 变体：`apply_patch` 作为标准 OpenAI function tool 暴露给模型，
+/// `arguments` 为 `{"input": <整段 patch 文本>}`。chat-wire 路径专用 ——
+/// freeform/grammar 工具会被 chat completions tools 装配器丢弃，必须用
+/// function 形态才能让 DeepSeek/GLM/Qwen 等看到。
+pub fn create_apply_patch_json_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "input".to_string(),
+        JsonSchema::string(Some(
+            "The entire contents of the apply_patch command".to_string(),
+        )),
+    )]);
+    ToolSpec::Function(ResponsesApiTool {
+        name: "apply_patch".to_string(),
+        description: APPLY_PATCH_JSON_TOOL_DESCRIPTION.to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["input".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
     })
 }
 

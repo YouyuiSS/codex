@@ -23,6 +23,7 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
+use crate::tools::handlers::apply_patch_spec::create_apply_patch_json_tool;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
@@ -42,6 +43,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -53,16 +55,42 @@ use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
-/// Handles freeform `apply_patch` requests and routes verified patches to the
+
+/// `ApplyPatchHandler` 支持两种 tool spec 形态，由 `ApplyPatchToolType` 决定：
+/// - `Freeform`：OpenAI Responses API 的 grammar-constrained custom tool，
+///   payload 走 `ToolPayload::Custom { input }`，input 是裸 patch 文本；
+/// - `Function`：标准 OpenAI Chat Completions function tool，
+///   `arguments = {"input": <patch>}`，payload 走 `ToolPayload::Function { arguments }`。
+///
+/// chat-wire 路径（DeepSeek/GLM/Qwen 等 OpenAI-compat provider）必须用
+/// `Function` —— chat completions 协议本身不支持 freeform/custom tool。
+/// Responses API 路径（GPT-5）继续用 `Freeform` 享受 grammar 约束。
+///
+/// 选择由 `apply_patch_tool_type` config 决定，sidecar 在 thread/start 时
+/// 由桌面端注入。
+///
+/// Handles `apply_patch` requests and routes verified patches to the
 /// selected environment filesystem.
-#[derive(Default)]
 pub struct ApplyPatchHandler {
     multi_environment: bool,
+    tool_type: ApplyPatchToolType,
+}
+
+impl Default for ApplyPatchHandler {
+    fn default() -> Self {
+        Self {
+            multi_environment: false,
+            tool_type: ApplyPatchToolType::Freeform,
+        }
+    }
 }
 
 impl ApplyPatchHandler {
-    pub(crate) fn new(multi_environment: bool) -> Self {
-        Self { multi_environment }
+    pub(crate) fn new(multi_environment: bool, tool_type: ApplyPatchToolType) -> Self {
+        Self {
+            multi_environment,
+            tool_type,
+        }
     }
 }
 
@@ -254,11 +282,26 @@ fn write_permissions_for_paths(
 }
 
 /// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
+///
+/// Both payload shapes describe the same edit:
+/// - `Custom { input }`: 来自 freeform/grammar 工具，`input` 就是裸 patch。
+/// - `Function { arguments }`: 来自 chat-wire JSON 工具，`arguments` 是
+///   `{"input": <patch>}` 形态的 JSON 字符串。
 fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
     match payload {
         ToolPayload::Custom { input } => Some(input.clone()),
+        ToolPayload::Function { arguments } => {
+            serde_json::from_str::<ApplyPatchToolArgs>(arguments)
+                .ok()
+                .map(|args| args.input)
+        }
         _ => None,
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApplyPatchToolArgs {
+    input: String,
 }
 
 async fn effective_patch_permissions(
@@ -304,11 +347,25 @@ impl ToolHandler for ApplyPatchHandler {
     }
 
     fn spec(&self) -> Option<ToolSpec> {
-        Some(create_apply_patch_freeform_tool(self.multi_environment))
+        Some(match self.tool_type {
+            ApplyPatchToolType::Freeform => {
+                create_apply_patch_freeform_tool(self.multi_environment)
+            }
+            // chat-wire / OpenAI-compat 路径走 JSON 函数形态。`multi_environment`
+            // 时 freeform 才有 environment_id grammar 扩展；JSON 工具 schema 就
+            // 是 `{input: string}`，environment 信息已经在 system prompt / hook
+            // input 里携带，不需要 schema 层 hint。
+            ApplyPatchToolType::Function => create_apply_patch_json_tool(),
+        })
     }
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Custom { .. })
+        // 同时接 Custom（freeform）和 Function（JSON）—— 由 tool_type 决定
+        // 模型用哪种发上来，这里两路都放行即可。
+        matches!(
+            payload,
+            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
+        )
     }
 
     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
@@ -331,6 +388,18 @@ impl ToolHandler for ApplyPatchHandler {
         invocation.payload = match invocation.payload {
             ToolPayload::Custom { .. } => ToolPayload::Custom {
                 input: patch.to_string(),
+            },
+            // Function 路径：保持 JSON 形态，把更新后的 patch 文本 re-encode 回
+            // `{"input": <patch>}` arguments 串。
+            ToolPayload::Function { .. } => ToolPayload::Function {
+                arguments: serde_json::to_string(&serde_json::json!({
+                    "input": patch.to_string(),
+                }))
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to re-encode apply_patch arguments: {err}"
+                    ))
+                })?,
             },
             payload => payload,
         };
@@ -365,10 +434,24 @@ impl ToolHandler for ApplyPatchHandler {
             ..
         } = invocation;
 
-        let ToolPayload::Custom { input: patch_input } = payload else {
-            return Err(FunctionCallError::RespondToModel(
-                "apply_patch handler received unsupported payload".to_string(),
-            ));
+        // 两路 payload 都吃：freeform 给 Custom 裸字符串；JSON tool 给
+        // Function 的 `{"input": <patch>}` arguments。这里提取出真正的 patch
+        // 文本喂给 codex_apply_patch::parse_patch。
+        let patch_input = match payload {
+            ToolPayload::Custom { input } => input,
+            ToolPayload::Function { arguments } => {
+                let args: ApplyPatchToolArgs = serde_json::from_str(&arguments).map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "apply_patch arguments are not valid JSON: {err}"
+                    ))
+                })?;
+                args.input
+            }
+            _ => {
+                return Err(FunctionCallError::RespondToModel(
+                    "apply_patch handler received unsupported payload".to_string(),
+                ));
+            }
         };
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,

@@ -219,10 +219,24 @@ impl ToolsConfig {
             model_shell_type
         };
 
+        // codex-tea fork divergence：默认 fallback 从 Freeform 改成 Function。
+        //
+        // 原因：codex-tea 主战场是 chat-wire（DeepSeek/GLM/Qwen 等 OpenAI-compat
+        // provider），Chat Completions 协议**没有** freeform / grammar-constrained
+        // custom tool 的概念，chat-wire 装配器会把 ToolSpec::Freeform 一律丢弃
+        // → 模型看不到 apply_patch tool → hallucinate 调用 → 即便我们扩展了
+        // dispatcher 能接住，模型仍要 trial-and-error 摸 schema。
+        //
+        // Function 变体在 Responses API 里也是合法 function tool（只是失去
+        // lark grammar 服务端约束），对 GPT-5 用户而言是微小体验退化，对 chat
+        // 用户而言是从"不可用"到"可用"。
+        //
+        // ModelInfo 显式配 Freeform 时仍尊重（GPT-5 catalog 走这条），这只
+        // 改 fallback 默认。
         let apply_patch_tool_type = model_info
             .apply_patch_tool_type
             .clone()
-            .or_else(|| include_apply_patch_tool.then_some(ApplyPatchToolType::Freeform));
+            .or_else(|| include_apply_patch_tool.then_some(ApplyPatchToolType::Function));
 
         let agent_jobs_worker_tools = include_agent_jobs
             && matches!(

@@ -202,7 +202,13 @@ pub enum ConfigShellToolType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyPatchToolType {
+    /// OpenAI Responses API custom tool (lark grammar-constrained).
+    /// Recommended for GPT-5 / Responses-capable providers.
     Freeform,
+    /// Standard Chat Completions function tool with JSON schema args
+    /// `{"input": <patch>}`. Use for OpenAI-compat providers that don't
+    /// support custom tools (DeepSeek / GLM / Qwen / etc.).
+    Function,
 }
 
 #[derive(
