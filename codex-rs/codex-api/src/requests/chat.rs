@@ -191,6 +191,29 @@ impl<'a> ChatRequestBuilder<'a> {
                             continue;
                         }
                         last_assistant_text = Some(text.clone());
+
+                        // **OpenAI Chat Completions 顺序约束**：assistant message
+                        // 携带 `tool_calls` 之后，**紧跟**的必须是 role=tool 的
+                        // 响应（每个 tool_call_id 对一条）。但 codex 内部按"完成
+                        // 顺序"存 ResponseItem —— FunctionCall 比 Message 早
+                        // finalize，所以迭代时 FunctionCall 已经先 push 成
+                        // `assistant{tool_calls=[...], content=null}`，紧接而来的
+                        // Message(assistant, text) 如果再单独 push 一条，就会
+                        // 出现 `assistant_tool_calls → assistant_text → tool`
+                        // 这种违法序列，DeepSeek 等严格 provider 直接 400 拒。
+                        //
+                        // OpenAI 规范允许 `content` + `tool_calls` 共存于同一条
+                        // assistant message —— 把 text 折叠到那条已有的 tool_calls
+                        // assistant 里（content 不再是 null），既符合规范又保留
+                        // 模型的解说文本。
+                        if let Some(Value::Object(prev_obj)) = messages.last_mut()
+                            && prev_obj.get("role").and_then(Value::as_str) == Some("assistant")
+                            && prev_obj.get("content").is_some_and(Value::is_null)
+                            && prev_obj.get("tool_calls").is_some()
+                        {
+                            prev_obj.insert("content".to_string(), json!(text));
+                            continue;
+                        }
                     }
 
                     let content_value = if role == "assistant" {
