@@ -24,7 +24,6 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-use codex_api::ChatDialect;
 
 type RealtimeWsStream = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
@@ -73,7 +72,6 @@ fn test_provider(base_url: String) -> Provider {
             retry_transport: false,
         },
         stream_idle_timeout: Duration::from_secs(5),
-        chat_dialect: ChatDialect::Strict,
     }
 }
 

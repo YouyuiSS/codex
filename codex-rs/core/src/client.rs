@@ -1359,6 +1359,18 @@ impl ModelClientSession {
                 self.client.state.auth_env_telemetry.clone(),
             );
 
+            // Chat Completions 方言：从 ModelProviderInfo 取出，翻译成 codex-api
+            // 边界的 ChatDialect，再分别传给 ChatRequestBuilder 和 ChatClient。
+            // `chat_dialect` 故意不上 codex-api::Provider 结构体，避免污染
+            // upstream（Provider 仅承载 HTTP 配置）。
+            let chat_dialect = self
+                .client
+                .state
+                .provider
+                .info()
+                .openai_chat_dialect
+                .to_api_dialect();
+
             // Build the chat-completions request body.
             let instructions = prompt.base_instructions.text.clone();
             let input = prompt.get_formatted_input();
@@ -1372,7 +1384,7 @@ impl ModelClientSession {
             )
             .conversation_id(Some(self.client.state.thread_id.to_string()))
             .session_source(Some(self.client.state.session_source.clone()))
-            .build(&client_setup.api_provider)
+            .build(chat_dialect)
             .map_err(map_api_error)?;
 
             let inference_trace_attempt = inference_trace.start_attempt();
@@ -1381,6 +1393,7 @@ impl ModelClientSession {
             let client = ApiChatClient::new(
                 transport,
                 client_setup.api_provider,
+                chat_dialect,
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));

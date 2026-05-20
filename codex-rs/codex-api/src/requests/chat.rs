@@ -1,6 +1,5 @@
 use crate::error::ApiError;
 use crate::provider::ChatDialect;
-use crate::provider::Provider;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
@@ -56,12 +55,12 @@ impl<'a> ChatRequestBuilder<'a> {
         self
     }
 
-    pub fn build(self, provider: &Provider) -> Result<ChatRequest, ApiError> {
+    pub fn build(self, dialect: ChatDialect) -> Result<ChatRequest, ApiError> {
         // 推理字段按方言决定。OpenAI 原生 Chat Completions 没有 reasoning 字段
         // → None，请求里不写。野鸡 thinking 模式（DeepSeek/GLM/Qwen 等）→
         // `reasoning_content`，下一轮请求必须把上一轮 sidecar 收到的推理原样
         // 回传，否则服务端硬校验拒收。新增方言时在这里加一条 match 分支。
-        let reasoning_field: Option<&'static str> = match provider.chat_dialect {
+        let reasoning_field: Option<&'static str> = match dialect {
             ChatDialect::Strict => None,
             ChatDialect::ThinkingReasoningContent => Some("reasoning_content"),
         };

@@ -85,6 +85,17 @@ pub enum OpenAiChatDialect {
     ThinkingReasoningContent,
 }
 
+impl OpenAiChatDialect {
+    /// 翻译为 codex-api 边界使用的 `ChatDialect`。chat-wire 调用点用这个方法
+    /// 把 config 侧方言取出来，传入 `ChatClient` / `ChatRequestBuilder`。
+    pub fn to_api_dialect(self) -> ApiChatDialect {
+        match self {
+            Self::Strict => ApiChatDialect::Strict,
+            Self::ThinkingReasoningContent => ApiChatDialect::ThinkingReasoningContent,
+        }
+    }
+}
+
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -302,12 +313,6 @@ impl ModelProviderInfo {
             headers,
             retry,
             stream_idle_timeout: self.stream_idle_timeout(),
-            chat_dialect: match self.openai_chat_dialect {
-                OpenAiChatDialect::Strict => ApiChatDialect::Strict,
-                OpenAiChatDialect::ThinkingReasoningContent => {
-                    ApiChatDialect::ThinkingReasoningContent
-                }
-            },
         })
     }
 

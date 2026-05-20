@@ -27,7 +27,6 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
-use codex_api::ChatDialect;
 
 fn assert_path_ends_with(requests: &[Request], suffix: &str) {
     assert_eq!(requests.len(), 1);
@@ -138,7 +137,6 @@ fn provider(name: &str) -> Provider {
             retry_transport: true,
         },
         stream_idle_timeout: Duration::from_millis(10),
-        chat_dialect: ChatDialect::Strict,
     }
 }
 

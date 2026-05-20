@@ -60,8 +60,6 @@ pub struct Provider {
     pub headers: HeaderMap,
     pub retry: RetryConfig,
     pub stream_idle_timeout: Duration,
-    /// Chat Completions 方言。仅当 chat-wire 路径用，Responses 路径忽略。
-    pub chat_dialect: ChatDialect,
 }
 
 impl Provider {

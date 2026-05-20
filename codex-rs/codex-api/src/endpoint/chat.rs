@@ -15,6 +15,7 @@ use crate::auth::SharedAuthProvider;
 use crate::common::ResponseStream;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
+use crate::provider::ChatDialect;
 use crate::provider::Provider;
 use crate::requests::ChatRequest;
 use crate::sse::chat::spawn_chat_stream;
@@ -28,13 +29,20 @@ use tracing::instrument;
 
 pub struct ChatClient<T: HttpTransport> {
     session: EndpointSession<T>,
+    dialect: ChatDialect,
     sse_telemetry: Option<Arc<dyn SseTelemetry>>,
 }
 
 impl<T: HttpTransport> ChatClient<T> {
-    pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
+    pub fn new(
+        transport: T,
+        provider: Provider,
+        dialect: ChatDialect,
+        auth: SharedAuthProvider,
+    ) -> Self {
         Self {
             session: EndpointSession::new(transport, provider, auth),
+            dialect,
             sse_telemetry: None,
         }
     }
@@ -46,6 +54,7 @@ impl<T: HttpTransport> ChatClient<T> {
     ) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+            dialect: self.dialect,
             sse_telemetry: sse,
         }
     }
@@ -83,7 +92,7 @@ impl<T: HttpTransport> ChatClient<T> {
             provider.stream_idle_timeout,
             self.sse_telemetry.clone(),
             None,
-            provider.chat_dialect,
+            self.dialect,
         ))
     }
 }

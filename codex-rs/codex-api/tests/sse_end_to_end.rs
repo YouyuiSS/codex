@@ -20,7 +20,6 @@ use http::HeaderMap;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use codex_api::ChatDialect;
 
 #[derive(Clone)]
 struct FixtureSseTransport {
@@ -72,7 +71,6 @@ fn provider(name: &str) -> Provider {
             retry_transport: true,
         },
         stream_idle_timeout: Duration::from_millis(50),
-        chat_dialect: ChatDialect::Strict,
     }
 }
 

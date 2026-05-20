@@ -20,7 +20,6 @@ use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
-use codex_api::ChatDialect;
 
 #[derive(Clone, Default)]
 struct DummyAuth;
@@ -43,7 +42,6 @@ fn provider(base_url: &str) -> Provider {
             retry_transport: true,
         },
         stream_idle_timeout: std::time::Duration::from_secs(1),
-        chat_dialect: ChatDialect::Strict,
     }
 }
 

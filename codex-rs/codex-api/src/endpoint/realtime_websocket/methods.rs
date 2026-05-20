@@ -826,7 +826,6 @@ fn normalize_realtime_path(url: &mut Url) {
 
 #[cfg(test)]
 mod tests {
-    use crate::provider::ChatDialect;
     use super::*;
     use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
     use codex_protocol::protocol::RealtimeHandoffRequested;
@@ -1672,7 +1671,6 @@ mod tests {
                 retry_transport: false,
             },
             stream_idle_timeout: Duration::from_secs(5),
-            chat_dialect: ChatDialect::Strict,
         };
         let client = RealtimeWebsocketClient::new(provider);
         let connection = client
@@ -1967,7 +1965,6 @@ mod tests {
                 retry_transport: false,
             },
             stream_idle_timeout: Duration::from_secs(5),
-            chat_dialect: ChatDialect::Strict,
         };
         let client = RealtimeWebsocketClient::new(provider);
         let connection = client
@@ -2083,7 +2080,6 @@ mod tests {
                 retry_transport: false,
             },
             stream_idle_timeout: Duration::from_secs(5),
-            chat_dialect: ChatDialect::Strict,
         };
         let client = RealtimeWebsocketClient::new(provider);
         let connection = client
@@ -2188,7 +2184,6 @@ mod tests {
                 retry_transport: false,
             },
             stream_idle_timeout: Duration::from_secs(5),
-            chat_dialect: ChatDialect::Strict,
         };
         let client = RealtimeWebsocketClient::new(provider);
         let connection = client
@@ -2279,7 +2274,6 @@ mod tests {
                 retry_transport: false,
             },
             stream_idle_timeout: Duration::from_secs(5),
-            chat_dialect: ChatDialect::Strict,
         };
         let client = RealtimeWebsocketClient::new(provider);
         let connection = client
