@@ -22,6 +22,7 @@ use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
@@ -53,6 +54,13 @@ impl ToolCallRuntime {
         tool_name: &codex_tools::ToolName,
     ) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
         self.router.create_diff_consumer(tool_name)
+    }
+
+    pub(crate) fn build_tool_call(
+        &self,
+        item: ResponseItem,
+    ) -> Result<Option<ToolCall>, FunctionCallError> {
+        self.router.build_model_tool_call(item)
     }
 
     #[instrument(level = "trace", skip_all)]

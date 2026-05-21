@@ -21,6 +21,8 @@ use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::ToolsConfig;
+use codex_tools::flatten_namespace_tool_name;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +40,7 @@ pub struct ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
+    chat_completions_tool_aliases: HashMap<String, ToolName>,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -74,7 +77,7 @@ impl ToolRouter {
             .filter(|tool| tool.defer_loading)
             .map(|tool| ToolName::new(tool.namespace.clone(), tool.name.clone()))
             .collect::<HashSet<_>>();
-        let model_visible_specs = specs
+        let model_visible_specs: Vec<ToolSpec> = specs
             .iter()
             .filter_map(|spec| {
                 if config.code_mode_only_enabled
@@ -86,10 +89,13 @@ impl ToolRouter {
                 filter_deferred_dynamic_tool_spec(spec.clone(), &deferred_dynamic_tools)
             })
             .collect();
+        let chat_completions_tool_aliases =
+            build_chat_completions_tool_aliases(&model_visible_specs);
 
         Self {
             registry,
             model_visible_specs,
+            chat_completions_tool_aliases,
         }
     }
 
@@ -110,8 +116,24 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
+        Self::build_tool_call_with_chat_aliases(item, &HashMap::new())
+    }
+
+    #[instrument(level = "trace", skip_all, err)]
+    pub fn build_model_tool_call(
+        &self,
+        item: ResponseItem,
+    ) -> Result<Option<ToolCall>, FunctionCallError> {
+        Self::build_tool_call_with_chat_aliases(item, &self.chat_completions_tool_aliases)
+    }
+
+    fn build_tool_call_with_chat_aliases(
+        item: ResponseItem,
+        chat_aliases: &HashMap<String, ToolName>,
+    ) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
             ResponseItem::FunctionCall {
                 name,
@@ -120,7 +142,13 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                let tool_name = ToolName::new(namespace, name);
+                let tool_name = match namespace {
+                    Some(namespace) => ToolName::namespaced(namespace, name),
+                    None => chat_aliases
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_else(|| ToolName::plain(name)),
+                };
                 Ok(Some(ToolCall {
                     tool_name,
                     call_id,
@@ -218,6 +246,26 @@ impl ToolRouter {
 
         self.registry.dispatch_any(invocation).await
     }
+}
+
+fn build_chat_completions_tool_aliases(specs: &[ToolSpec]) -> HashMap<String, ToolName> {
+    let mut aliases = HashMap::new();
+    for spec in specs {
+        let ToolSpec::Namespace(namespace) = spec else {
+            continue;
+        };
+        for tool in &namespace.tools {
+            match tool {
+                ResponsesApiNamespaceTool::Function(tool) => {
+                    aliases.insert(
+                        flatten_namespace_tool_name(namespace.name.as_str(), tool.name.as_str()),
+                        ToolName::namespaced(namespace.name.clone(), tool.name.clone()),
+                    );
+                }
+            }
+        }
+    }
+    aliases
 }
 
 pub(crate) fn extension_tool_bundles(session: &Session) -> Vec<ExtensionToolBundle> {

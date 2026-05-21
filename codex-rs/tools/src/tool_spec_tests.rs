@@ -8,6 +8,7 @@ use crate::FreeformToolFormat;
 use crate::JsonSchema;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
+use crate::create_tools_json_for_chat_completions_api;
 use crate::create_tools_json_for_responses_api;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
@@ -192,6 +193,47 @@ fn namespace_tool_spec_serializes_expected_wire_shape() {
                 },
             ],
         })
+    );
+}
+
+#[test]
+fn create_tools_json_for_chat_completions_api_flattens_namespace_tools() {
+    assert_eq!(
+        create_tools_json_for_chat_completions_api(&[ToolSpec::Namespace(ResponsesApiNamespace {
+            name: "mcp__demo__".to_string(),
+            description: "Demo tools".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: "lookup_order".to_string(),
+                description: "Look up an order".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: JsonSchema::object(
+                    BTreeMap::from([(
+                        "order_id".to_string(),
+                        JsonSchema::string(/*description*/ None),
+                    )]),
+                    /*required*/ None,
+                    /*additional_properties*/ None,
+                ),
+                output_schema: None,
+            })],
+        })])
+        .expect("serialize tools for chat completions"),
+        vec![json!({
+            "type": "function",
+            "name": "mcp__demo__lookup_order",
+            "function": {
+                "name": "mcp__demo__lookup_order",
+                "description": "Look up an order",
+                "strict": false,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "order_id": { "type": "string" },
+                    },
+                },
+            },
+        })]
     );
 }
 

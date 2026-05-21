@@ -157,6 +157,51 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn build_model_tool_call_resolves_flat_chat_namespace_alias() -> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+    let router = ToolRouter::from_config(
+        &turn.tools_config,
+        ToolRouterParams {
+            deferred_mcp_tools: None,
+            mcp_tools: Some(vec![mcp_tool_info(
+                "calendar",
+                /*supports_parallel_tool_calls*/ false,
+                "mcp__codex_apps__calendar",
+                "_create_event",
+            )]),
+            unavailable_called_tools: Vec::new(),
+            discoverable_tools: None,
+            extension_tool_bundles: Vec::new(),
+            dynamic_tools: turn.dynamic_tools.as_slice(),
+        },
+    );
+
+    let call = router
+        .build_model_tool_call(ResponseItem::FunctionCall {
+            id: None,
+            name: "mcp__codex_apps__calendar_create_event".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-flat-chat-namespace".to_string(),
+        })?
+        .expect("function_call should produce a tool call");
+
+    assert_eq!(
+        call.tool_name,
+        ToolName::namespaced("mcp__codex_apps__calendar", "_create_event")
+    );
+    assert_eq!(call.call_id, "call-flat-chat-namespace");
+    match call.payload {
+        ToolPayload::Function { arguments } => {
+            assert_eq!(arguments, "{}");
+        }
+        other => panic!("expected function payload, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
     let router = ToolRouter::from_config(

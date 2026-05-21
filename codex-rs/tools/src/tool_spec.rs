@@ -9,6 +9,7 @@ use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLo
 use codex_protocol::config_types::WebSearchUserLocationType;
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::json;
 
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
 /// Responses API.
@@ -99,35 +100,56 @@ pub fn create_tools_json_for_responses_api(
 pub fn create_tools_json_for_chat_completions_api(
     tools: &[ToolSpec],
 ) -> Result<Vec<Value>, serde_json::Error> {
-    // Start with the JSON for the Responses API and rewrite it to match
-    // the chat completions tool call format.
-    let responses_api_tools_json = create_tools_json_for_responses_api(tools)?;
-    let tools_json = responses_api_tools_json
-        .into_iter()
-        .filter_map(|mut tool| {
-            if tool.get("type") != Some(&Value::String("function".to_string())) {
-                return None;
+    let mut tools_json = Vec::new();
+    for tool in tools {
+        match tool {
+            ToolSpec::Function(tool) => {
+                tools_json.push(create_chat_completions_function_tool(tool.clone())?);
             }
-
-            if let Some(map) = tool.as_object_mut() {
-                let name = map
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // Remove "type" field as it is not needed in chat completions.
-                map.remove("type");
-                Some(serde_json::json!({
-                    "type": "function",
-                    "name": name,
-                    "function": map,
-                }))
-            } else {
-                None
+            ToolSpec::Namespace(namespace) => {
+                for tool in &namespace.tools {
+                    match tool {
+                        crate::ResponsesApiNamespaceTool::Function(tool) => {
+                            let mut tool = tool.clone();
+                            tool.name =
+                                flatten_namespace_tool_name(&namespace.name, tool.name.as_str());
+                            tools_json.push(create_chat_completions_function_tool(tool)?);
+                        }
+                    }
+                }
             }
-        })
-        .collect::<Vec<Value>>();
+            ToolSpec::ToolSearch { .. }
+            | ToolSpec::LocalShell {}
+            | ToolSpec::ImageGeneration { .. }
+            | ToolSpec::WebSearch { .. }
+            | ToolSpec::Freeform(_) => {}
+        }
+    }
     Ok(tools_json)
+}
+
+pub fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+    format!("{namespace}{name}")
+}
+
+fn create_chat_completions_function_tool(
+    tool: ResponsesApiTool,
+) -> Result<Value, serde_json::Error> {
+    let Value::Object(mut map) = serde_json::to_value(ToolSpec::Function(tool))? else {
+        unreachable!("ToolSpec::Function must serialize to a JSON object")
+    };
+    let name = map
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // Chat Completions nests the Responses function body under `function`.
+    map.remove("type");
+    Ok(json!({
+        "type": "function",
+        "name": name,
+        "function": map,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
