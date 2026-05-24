@@ -358,7 +358,9 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
         // 这里同步去掉 Option 包装。Hook / payload / diff 方法移到下方
         // CoreToolRuntime impl，与上游 trait 拆分对齐。
         match self.tool_type {
-            ApplyPatchToolType::Freeform => create_apply_patch_freeform_tool(self.multi_environment),
+            ApplyPatchToolType::Freeform => {
+                create_apply_patch_freeform_tool(self.multi_environment)
+            }
             ApplyPatchToolType::Function => create_apply_patch_json_tool(),
         }
     }

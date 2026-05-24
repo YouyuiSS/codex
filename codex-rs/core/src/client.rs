@@ -33,6 +33,8 @@ use std::sync::atomic::Ordering;
 
 use codex_api::ApiError;
 use codex_api::AuthProvider;
+use codex_api::ChatClient as ApiChatClient;
+use codex_api::ChatRequestBuilder;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::Compression;
@@ -47,8 +49,6 @@ use codex_api::Reasoning;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
 use codex_api::ResponseCreateWsRequest;
-use codex_api::ChatClient as ApiChatClient;
-use codex_api::ChatRequestBuilder;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient as ApiResponsesClient;
 use codex_api::ResponsesOptions as ApiResponsesOptions;
@@ -1390,16 +1390,11 @@ impl ModelClientSession {
             let input = prompt.get_formatted_input();
             let tools = create_tools_json_for_chat_completions_api(&prompt.tools)
                 .map_err(|e| CodexErr::UnsupportedOperation(e.to_string()))?;
-            let request = ChatRequestBuilder::new(
-                &model_info.slug,
-                &instructions,
-                &input,
-                &tools,
-            )
-            .conversation_id(Some(self.client.state.thread_id.to_string()))
-            .session_source(Some(self.client.state.session_source.clone()))
-            .build(chat_dialect)
-            .map_err(map_api_error)?;
+            let request = ChatRequestBuilder::new(&model_info.slug, &instructions, &input, &tools)
+                .conversation_id(Some(self.client.state.thread_id.to_string()))
+                .session_source(Some(self.client.state.session_source.clone()))
+                .build(chat_dialect)
+                .map_err(map_api_error)?;
 
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.record_started(&request.body);
@@ -1761,13 +1756,8 @@ impl ModelClientSession {
                 // are also not part of the chat API surface (DeepSeek etc.
                 // expose plain `/v1/chat/completions`). Ignore those args.
                 let _ = (effort, summary, service_tier, turn_metadata_header);
-                self.stream_chat_completions(
-                    prompt,
-                    model_info,
-                    session_telemetry,
-                    inference_trace,
-                )
-                .await
+                self.stream_chat_completions(prompt, model_info, session_telemetry, inference_trace)
+                    .await
             }
         }
     }

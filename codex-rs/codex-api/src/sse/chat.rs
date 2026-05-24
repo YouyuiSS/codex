@@ -30,7 +30,14 @@ pub(crate) fn spawn_chat_stream(
 ) -> ResponseStream {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
-        process_chat_sse(stream_response.bytes, tx_event, idle_timeout, telemetry, dialect).await;
+        process_chat_sse(
+            stream_response.bytes,
+            tx_event,
+            idle_timeout,
+            telemetry,
+            dialect,
+        )
+        .await;
     });
     ResponseStream {
         rx_event,
@@ -180,12 +187,8 @@ pub async fn process_chat_sse<S>(
                     ChatDialect::ThinkingReasoningContent => {
                         if let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str())
                         {
-                            append_reasoning_text(
-                                &tx_event,
-                                &mut reasoning_item,
-                                text.to_string(),
-                            )
-                            .await;
+                            append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                                .await;
                         }
                     }
                 }
@@ -271,12 +274,8 @@ pub async fn process_chat_sse<S>(
                         if let Some(text) =
                             message.get("reasoning_content").and_then(|v| v.as_str())
                         {
-                            append_reasoning_text(
-                                &tx_event,
-                                &mut reasoning_item,
-                                text.to_string(),
-                            )
-                            .await;
+                            append_reasoning_text(&tx_event, &mut reasoning_item, text.to_string())
+                                .await;
                         }
                     }
                 }

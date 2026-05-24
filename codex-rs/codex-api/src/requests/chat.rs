@@ -291,7 +291,9 @@ impl<'a> ChatRequestBuilder<'a> {
                                     Some(json!({"type":"text","text": text}))
                                 }
                                 FunctionCallOutputContentItem::InputImage { image_url, .. } => {
-                                    Some(json!({"type":"image_url","image_url": {"url": image_url}}))
+                                    Some(
+                                        json!({"type":"image_url","image_url": {"url": image_url}}),
+                                    )
                                 }
                                 // codex-tea fork: 上游为 Responses API 加密内容
                                 // 增加的 opaque blob 变体。chat completions wire
@@ -332,7 +334,9 @@ impl<'a> ChatRequestBuilder<'a> {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
                     push_tool_call_message(&mut messages, tool_call, reasoning, reasoning_field);
                 }
-                ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+                ResponseItem::CustomToolCallOutput {
+                    call_id, output, ..
+                } => {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
