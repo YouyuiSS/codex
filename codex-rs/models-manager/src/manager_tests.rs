@@ -279,6 +279,33 @@ async fn get_model_info_uses_custom_catalog() {
 }
 
 #[tokio::test]
+async fn get_model_info_uses_config_model_catalog_before_fallback() {
+    let codex_home = tempdir().expect("temp dir");
+    let mut catalog_model = remote_model("external-chat", "External Chat", /*priority*/ 0);
+    catalog_model.context_window = Some(1_000_000);
+    catalog_model.max_context_window = Some(1_000_000);
+    catalog_model.supports_parallel_tool_calls = true;
+    let config = ModelsManagerConfig {
+        model_catalog: Some(ModelsResponse {
+            models: vec![catalog_model],
+        }),
+        ..Default::default()
+    };
+    let manager = openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::new(Vec::new()),
+    );
+
+    let model_info = manager.get_model_info("external-chat-pro", &config).await;
+
+    assert_eq!(model_info.slug, "external-chat-pro");
+    assert_eq!(model_info.display_name, "External Chat");
+    assert_eq!(model_info.context_window, Some(1_000_000));
+    assert!(model_info.supports_parallel_tool_calls);
+    assert!(!model_info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
 async fn get_model_info_matches_namespaced_suffix() {
     let config = ModelsManagerConfig::default();
     let mut remote = remote_model("gpt-image", "Image", /*priority*/ 0);

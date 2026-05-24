@@ -437,20 +437,30 @@ fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Opt
     find_model_by_longest_prefix(suffix, candidates)
 }
 
+fn find_model_in_candidates(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
+    find_model_by_longest_prefix(model, candidates)
+        .or_else(|| find_model_by_namespaced_suffix(model, candidates))
+}
+
 pub(crate) fn construct_model_info_from_candidates(
     model: &str,
     candidates: &[ModelInfo],
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
-    // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
-    // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-    let remote = find_model_by_longest_prefix(model, candidates)
-        .or_else(|| find_model_by_namespaced_suffix(model, candidates));
-    let model_info = if let Some(remote) = remote {
+    // Prefer an explicitly configured model catalog before bundled/remote metadata.
+    // This keeps provider-specific knowledge outside the runtime code: custom OpenAI-
+    // compatible providers can supply their own catalog without adding hard-coded
+    // vendor branches here.
+    let configured = config
+        .model_catalog
+        .as_ref()
+        .and_then(|catalog| find_model_in_candidates(model, &catalog.models));
+    let candidate = configured.or_else(|| find_model_in_candidates(model, candidates));
+    let model_info = if let Some(candidate) = candidate {
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
-            ..remote
+            ..candidate
         }
     } else {
         model_info::model_info_from_slug(model)
