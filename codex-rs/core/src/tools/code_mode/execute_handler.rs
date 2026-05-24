@@ -2,7 +2,9 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::registry::ToolHandler;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
@@ -36,12 +38,6 @@ impl CodeModeExecuteHandler {
         let exec = ExecContext { session, turn };
         let enabled_tools =
             codex_tools::collect_code_mode_tool_definitions(&self.nested_tool_specs);
-        let stored_values = exec
-            .session
-            .services
-            .code_mode_service
-            .stored_values()
-            .await;
         // Allocate before starting V8 so the trace can create the parent
         // CodeCell before model-authored JavaScript issues nested tool calls.
         let runtime_cell_id = exec.session.services.code_mode_service.allocate_cell_id();
@@ -65,7 +61,6 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id,
                 enabled_tools,
                 source: args.code,
-                stored_values,
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
             })
@@ -86,22 +81,20 @@ impl CodeModeExecuteHandler {
     }
 }
 
-impl ToolHandler for CodeModeExecuteHandler {
-    type Output = FunctionToolOutput;
-
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(PUBLIC_TOOL_NAME)
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(self.spec.clone())
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
     }
 
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Custom { .. })
-    }
-
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -112,12 +105,19 @@ impl ToolHandler for CodeModeExecuteHandler {
         } = invocation;
 
         match payload {
-            ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => {
-                self.execute(session, turn, call_id, input).await
-            }
+            ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
+                .execute(session, turn, call_id, input)
+                .await
+                .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(
                 "{PUBLIC_TOOL_NAME} expects raw JavaScript source text"
             ))),
         }
+    }
+}
+
+impl CoreToolRuntime for CodeModeExecuteHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Custom { .. })
     }
 }

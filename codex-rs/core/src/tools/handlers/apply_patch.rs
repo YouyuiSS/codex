@@ -17,8 +17,8 @@ use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
@@ -28,10 +28,11 @@ use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::orchestrator::ToolOrchestrator;
+use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolArgumentDiffConsumer;
-use crate::tools::registry::ToolHandler;
+use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
@@ -339,91 +340,33 @@ async fn effective_patch_permissions(
     )
 }
 
-impl ToolHandler for ApplyPatchHandler {
-    type Output = ApplyPatchToolOutput;
-
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("apply_patch")
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(match self.tool_type {
-            ApplyPatchToolType::Freeform => {
-                create_apply_patch_freeform_tool(self.multi_environment)
-            }
-            // chat-wire / OpenAI-compat 路径走 JSON 函数形态。`multi_environment`
-            // 时 freeform 才有 environment_id grammar 扩展；JSON 工具 schema 就
-            // 是 `{input: string}`，environment 信息已经在 system prompt / hook
-            // input 里携带，不需要 schema 层 hint。
+    fn spec(&self) -> ToolSpec {
+        // codex-tea fork: ApplyPatchHandler 支持两种 spec 形态，由
+        // `model_info.apply_patch_tool_type` 决定。Function 形态服务 chat-wire
+        // (DeepSeek/GLM/Qwen 等 OpenAI-compat provider)——chat completions 协议
+        // 没有 freeform/grammar-constrained custom tool，必须走标准 function。
+        // Freeform 形态留给 Responses API (GPT-5)，享受 lark grammar 服务端约束。
+        // multi_environment 只对 freeform 有意义（environment_id grammar 扩展），
+        // JSON 工具 schema 就是 `{input: string}`，environment 信息走 system
+        // prompt / hook input。上游 spec() 在 #23870 后由 Option 改为强制返回，
+        // 这里同步去掉 Option 包装。Hook / payload / diff 方法移到下方
+        // CoreToolRuntime impl，与上游 trait 拆分对齐。
+        match self.tool_type {
+            ApplyPatchToolType::Freeform => create_apply_patch_freeform_tool(self.multi_environment),
             ApplyPatchToolType::Function => create_apply_patch_json_tool(),
-        })
+        }
     }
 
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        // 同时接 Custom（freeform）和 Function（JSON）—— 由 tool_type 决定
-        // 模型用哪种发上来，这里两路都放行即可。
-        matches!(
-            payload,
-            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
-        )
-    }
-
-    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
-        Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
-    }
-
-    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        apply_patch_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
-            tool_name: HookToolName::apply_patch(),
-            tool_input: serde_json::json!({ "command": command }),
-        })
-    }
-
-    fn with_updated_hook_input(
+    async fn handle(
         &self,
-        mut invocation: ToolInvocation,
-        updated_input: serde_json::Value,
-    ) -> Result<ToolInvocation, FunctionCallError> {
-        let patch = updated_hook_command(&updated_input)?;
-        invocation.payload = match invocation.payload {
-            ToolPayload::Custom { .. } => ToolPayload::Custom {
-                input: patch.to_string(),
-            },
-            // Function 路径：保持 JSON 形态，把更新后的 patch 文本 re-encode 回
-            // `{"input": <patch>}` arguments 串。
-            ToolPayload::Function { .. } => ToolPayload::Function {
-                arguments: serde_json::to_string(&serde_json::json!({
-                    "input": patch.to_string(),
-                }))
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "failed to re-encode apply_patch arguments: {err}"
-                    ))
-                })?,
-            },
-            payload => payload,
-        };
-        Ok(invocation)
-    }
-
-    fn post_tool_use_payload(
-        &self,
-        invocation: &ToolInvocation,
-        result: &Self::Output,
-    ) -> Option<PostToolUsePayload> {
-        let tool_response =
-            result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
-        Some(PostToolUsePayload {
-            tool_name: HookToolName::apply_patch(),
-            tool_use_id: invocation.call_id.clone(),
-            tool_input: serde_json::json!({
-                "command": apply_patch_payload_command(&invocation.payload)?,
-            }),
-            tool_response,
-        })
-    }
-
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -474,8 +417,7 @@ impl ToolHandler for ApplyPatchHandler {
         };
         let cwd = turn_environment.cwd.clone();
         let fs = turn_environment.environment.get_filesystem();
-        let mut sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None);
-        sandbox.cwd = Some(cwd.clone());
+        let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, &cwd);
         match codex_apply_patch::verify_apply_patch_args(args, &cwd, fs.as_ref(), Some(&sandbox))
             .await
         {
@@ -488,7 +430,7 @@ impl ToolHandler for ApplyPatchHandler {
                 {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
-                        Ok(ApplyPatchToolOutput::from_text(content))
+                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
                     }
                     InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
                         let changes = convert_apply_patch_to_protocol(&apply.action);
@@ -543,7 +485,7 @@ impl ToolHandler for ApplyPatchHandler {
                             Some(&tracker),
                         );
                         let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
-                        Ok(ApplyPatchToolOutput::from_text(content))
+                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
                     }
                 }
             }
@@ -567,6 +509,72 @@ impl ToolHandler for ApplyPatchHandler {
     }
 }
 
+impl CoreToolRuntime for ApplyPatchHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        // codex-tea fork: 同时接 Custom（freeform）和 Function（JSON）—— 由
+        // tool_type 决定模型用哪种发上来，dispatcher 两路都放行即可。
+        matches!(
+            payload,
+            ToolPayload::Custom { .. } | ToolPayload::Function { .. }
+        )
+    }
+
+    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+        Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
+    }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        apply_patch_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_input: serde_json::json!({ "command": command }),
+        })
+    }
+
+    fn with_updated_hook_input(
+        &self,
+        mut invocation: ToolInvocation,
+        updated_input: serde_json::Value,
+    ) -> Result<ToolInvocation, FunctionCallError> {
+        let patch = updated_hook_command(&updated_input)?;
+        invocation.payload = match invocation.payload {
+            ToolPayload::Custom { .. } => ToolPayload::Custom {
+                input: patch.to_string(),
+            },
+            // codex-tea fork: Function (chat-wire JSON) 路径——把更新后的 patch
+            // 文本 re-encode 回 `{"input": <patch>}` arguments 串。
+            ToolPayload::Function { .. } => ToolPayload::Function {
+                arguments: serde_json::to_string(&serde_json::json!({
+                    "input": patch.to_string(),
+                }))
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to re-encode apply_patch arguments: {err}"
+                    ))
+                })?,
+            },
+            payload => payload,
+        };
+        Ok(invocation)
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &dyn crate::tools::context::ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        let tool_response =
+            result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
+        Some(PostToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_use_id: invocation.call_id.clone(),
+            tool_input: serde_json::json!({
+                "command": apply_patch_payload_command(&invocation.payload)?,
+            }),
+            tool_response,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_apply_patch(
     command: &[String],
@@ -579,8 +587,7 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
-    let mut sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None);
-    sandbox.cwd = Some(cwd.clone());
+    let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, Some(&sandbox))
         .await
     {

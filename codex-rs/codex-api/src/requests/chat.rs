@@ -82,6 +82,11 @@ impl<'a> ChatRequestBuilder<'a> {
                 ResponseItem::CustomToolCallOutput { .. } => {}
                 ResponseItem::WebSearchCall { .. } => {}
                 ResponseItem::Compaction { .. } => {}
+                // codex-tea fork: 上游 #23xxx 后新增的 ResponseItem 变体——
+                // CompactionTrigger 是 unit marker（"此处触发了一次 compaction"），
+                // 对 chat-wire role 顺序判定无意义，与 Other/Compaction 同等待遇
+                // 一律忽略。
+                ResponseItem::CompactionTrigger => {}
                 ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }
@@ -281,13 +286,19 @@ impl<'a> ChatRequestBuilder<'a> {
                     let content_value = if let Some(items) = output.content_items() {
                         let mapped: Vec<Value> = items
                             .iter()
-                            .map(|it| match it {
+                            .filter_map(|it| match it {
                                 FunctionCallOutputContentItem::InputText { text } => {
-                                    json!({"type":"text","text": text})
+                                    Some(json!({"type":"text","text": text}))
                                 }
                                 FunctionCallOutputContentItem::InputImage { image_url, .. } => {
-                                    json!({"type":"image_url","image_url": {"url": image_url}})
+                                    Some(json!({"type":"image_url","image_url": {"url": image_url}}))
                                 }
+                                // codex-tea fork: 上游为 Responses API 加密内容
+                                // 增加的 opaque blob 变体。chat completions wire
+                                // 没法 round-trip 加密 content，丢弃即可——与
+                                // `function_call_output_content_items_to_text`
+                                // 中对该 variant 的处理一致。
+                                FunctionCallOutputContentItem::EncryptedContent { .. } => None,
                             })
                             .collect();
                         json!(mapped)
@@ -332,6 +343,7 @@ impl<'a> ChatRequestBuilder<'a> {
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Other
                 | ResponseItem::Compaction { .. }
+                | ResponseItem::CompactionTrigger
                 | ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }

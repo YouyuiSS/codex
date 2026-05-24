@@ -2,8 +2,10 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
-use crate::tools::registry::ToolHandler;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use crate::tools::tool_search_entry::ToolSearchEntry;
 use crate::tools::tool_search_entry::ToolSearchInfo;
 use bm25::Document;
@@ -51,18 +53,14 @@ impl ToolSearchHandler {
     }
 }
 
-impl ToolHandler for ToolSearchHandler {
-    type Output = ToolSearchOutput;
-
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for ToolSearchHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(TOOL_SEARCH_TOOL_NAME)
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        Some(create_tool_search_tool(
-            &self.search_source_infos,
-            TOOL_SEARCH_DEFAULT_LIMIT,
-        ))
+    fn spec(&self) -> ToolSpec {
+        create_tool_search_tool(&self.search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT)
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -72,7 +70,7 @@ impl ToolHandler for ToolSearchHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-    ) -> Result<ToolSearchOutput, FunctionCallError> {
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation { payload, .. } = invocation;
 
         let args = match payload {
@@ -99,14 +97,16 @@ impl ToolHandler for ToolSearchHandler {
         }
 
         if self.entries.is_empty() {
-            return Ok(ToolSearchOutput { tools: Vec::new() });
+            return Ok(boxed_tool_output(ToolSearchOutput { tools: Vec::new() }));
         }
 
         let tools = self.search(query, limit)?;
 
-        Ok(ToolSearchOutput { tools })
+        Ok(boxed_tool_output(ToolSearchOutput { tools }))
     }
 }
+
+impl CoreToolRuntime for ToolSearchHandler {}
 
 impl ToolSearchHandler {
     fn search(
@@ -171,6 +171,7 @@ mod tests {
             .iter()
             .map(|tool| {
                 McpHandler::new(tool.clone())
+                    .expect("MCP tool should convert")
                     .search_info()
                     .expect("MCP handler should return search info")
             })

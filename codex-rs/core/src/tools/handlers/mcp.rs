@@ -6,13 +6,11 @@ use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::original_image_detail::can_request_original_image_detail;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::flat_tool_name;
-use crate::tools::hook_names::HookToolName;
-use crate::tools::registry::PostToolUsePayload;
-use crate::tools::registry::PreToolUsePayload;
-use crate::tools::registry::ToolHandler;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
 use crate::tools::tool_search_entry::ToolSearchInfo;
 use codex_mcp::ToolInfo;
@@ -22,145 +20,46 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use codex_tools::mcp_tool_to_responses_api_tool;
-use serde_json::Map;
-use serde_json::Value;
 
 pub struct McpHandler {
     tool_info: ToolInfo,
+    spec: ToolSpec,
 }
 
 impl McpHandler {
-    pub fn new(tool_info: ToolInfo) -> Self {
-        Self { tool_info }
+    pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
+        let spec = create_tool_spec(&tool_info)?;
+        Ok(Self { tool_info, spec })
     }
 }
 
-impl ToolHandler for McpHandler {
-    type Output = McpToolOutput;
-
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {
         self.tool_info.canonical_tool_name()
     }
 
-    fn spec(&self) -> Option<ToolSpec> {
-        let tool_name = self.tool_name();
-        let namespace_name = tool_name.namespace.as_ref()?;
-        let tool = mcp_tool_to_responses_api_tool(&tool_name, &self.tool_info.tool).ok()?;
-        let description = self
-            .tool_info
-            .namespace_description
-            .as_deref()
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                self.tool_info
-                    .connector_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|connector_name| !connector_name.is_empty())
-                    .map(|connector_name| format!("Tools for working with {connector_name}."))
-            })
-            .unwrap_or_default();
-
-        Some(ToolSpec::Namespace(ResponsesApiNamespace {
-            name: namespace_name.clone(),
-            description,
-            tools: vec![ResponsesApiNamespaceTool::Function(tool)],
-        }))
-    }
-
-    fn search_info(&self) -> Option<ToolSearchInfo> {
-        let source_name = self
-            .tool_info
-            .connector_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|connector_name| !connector_name.is_empty())
-            .unwrap_or_else(|| self.tool_info.server_name.trim());
-        let source_info = (!source_name.is_empty()).then(|| ToolSearchSourceInfo {
-            name: source_name.to_string(),
-            description: self
-                .tool_info
-                .namespace_description
-                .as_deref()
-                .map(str::trim)
-                .filter(|description| !description.is_empty())
-                .map(str::to_string),
-        });
-
-        ToolSearchInfo::from_spec(
-            build_mcp_search_text(&self.tool_info),
-            self.spec()?,
-            source_info,
-        )
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
+        // Correctly implemented MCP servers should tolerate parallel calls to
+        // tools that advertise themselves as read-only.
         self.tool_info.supports_parallel_tool_calls
+            || self
+                .tool_info
+                .tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                .unwrap_or(false)
     }
 
-    async fn telemetry_tags(&self, _invocation: &ToolInvocation) -> ToolTelemetryTags {
-        let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
-        if let Some(origin) = &self.tool_info.server_origin {
-            tags.push(("mcp_server_origin", origin.clone()));
-        }
-        tags
-    }
-
-    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        let ToolPayload::Function { arguments } = &invocation.payload else {
-            return None;
-        };
-
-        Some(PreToolUsePayload {
-            tool_name: HookToolName::new(self.tool_name().to_string()),
-            tool_input: mcp_hook_tool_input(arguments),
-        })
-    }
-
-    fn with_updated_hook_input(
+    async fn handle(
         &self,
-        mut invocation: ToolInvocation,
-        updated_input: Value,
-    ) -> Result<ToolInvocation, FunctionCallError> {
-        invocation.payload = match invocation.payload {
-            ToolPayload::Function { .. } => ToolPayload::Function {
-                arguments: serde_json::to_string(&updated_input).map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "failed to serialize rewritten MCP arguments: {err}"
-                    ))
-                })?,
-            },
-            payload => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "tool {} does not support hook input rewriting for payload {payload:?}",
-                    self.tool_name()
-                )));
-            }
-        };
-        Ok(invocation)
-    }
-    fn post_tool_use_payload(
-        &self,
-        invocation: &ToolInvocation,
-        result: &Self::Output,
-    ) -> Option<PostToolUsePayload> {
-        let ToolPayload::Function { .. } = &invocation.payload else {
-            return None;
-        };
-
-        let tool_response =
-            result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
-        Some(PostToolUsePayload {
-            tool_name: HookToolName::new(self.tool_name().to_string()),
-            tool_use_id: invocation.call_id.clone(),
-            tool_input: result.tool_input.clone(),
-            tool_response,
-        })
-    }
-
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -190,22 +89,81 @@ impl ToolHandler for McpHandler {
         )
         .await;
 
-        Ok(McpToolOutput {
+        Ok(boxed_tool_output(McpToolOutput {
             result: result.result,
             tool_input: result.tool_input,
             wall_time: started.elapsed(),
             original_image_detail_supported: can_request_original_image_detail(&turn.model_info),
             truncation_policy: turn.truncation_policy,
+        }))
+    }
+}
+
+impl CoreToolRuntime for McpHandler {
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        let source_name = self
+            .tool_info
+            .connector_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|connector_name| !connector_name.is_empty())
+            .unwrap_or_else(|| self.tool_info.server_name.trim());
+        let source_info = (!source_name.is_empty()).then(|| ToolSearchSourceInfo {
+            name: source_name.to_string(),
+            description: self
+                .tool_info
+                .namespace_description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_string),
+        });
+
+        ToolSearchInfo::from_spec(
+            build_mcp_search_text(&self.tool_info),
+            self.spec(),
+            source_info,
+        )
+    }
+
+    fn telemetry_tags<'a>(
+        &'a self,
+        _invocation: &'a ToolInvocation,
+    ) -> futures::future::BoxFuture<'a, ToolTelemetryTags> {
+        Box::pin(async {
+            let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
+            if let Some(origin) = &self.tool_info.server_origin {
+                tags.push(("mcp_server_origin", origin.clone()));
+            }
+            tags
         })
     }
 }
 
-fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
-    if raw_arguments.trim().is_empty() {
-        return Value::Object(Map::new());
-    }
+fn create_tool_spec(tool_info: &ToolInfo) -> Result<ToolSpec, serde_json::Error> {
+    let tool_name = tool_info.canonical_tool_name();
+    let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
+    let description = tool_info
+        .namespace_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            tool_info
+                .connector_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|connector_name| !connector_name.is_empty())
+                .map(|connector_name| format!("Tools for working with {connector_name}."))
+        })
+        .unwrap_or_default();
 
-    serde_json::from_str(raw_arguments).unwrap_or_else(|_| Value::String(raw_arguments.to_string()))
+    Ok(ToolSpec::Namespace(ResponsesApiNamespace {
+        name: tool_info.callable_namespace.clone(),
+        description,
+        tools: vec![ResponsesApiNamespaceTool::Function(tool)],
+    }))
 }
 
 fn build_mcp_search_text(info: &ToolInfo) -> String {
@@ -265,6 +223,9 @@ mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context;
     use crate::tools::context::ToolCallSource;
+    use crate::tools::hook_names::HookToolName;
+    use crate::tools::registry::PostToolUsePayload;
+    use crate::tools::registry::PreToolUsePayload;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -283,7 +244,8 @@ mod tests {
             .to_string(),
         };
         let (session, turn) = make_session_and_context().await;
-        let handler = McpHandler::new(tool_info("memory", "mcp__memory__", "create_entities"));
+        let handler = McpHandler::new(tool_info("memory", "mcp__memory__", "create_entities"))
+            .expect("MCP tool spec should build");
         assert_eq!(
             handler.pre_tool_use_payload(&ToolInvocation {
                 session: session.into(),
@@ -313,7 +275,8 @@ mod tests {
             arguments: json!({ "message": "hello" }).to_string(),
         };
         let (session, turn) = make_session_and_context().await;
-        let handler = McpHandler::new(tool_info("foo", "mcp__foo__", "exec_command"));
+        let handler = McpHandler::new(tool_info("foo", "mcp__foo__", "exec_command"))
+            .expect("MCP tool spec should build");
 
         assert_eq!(
             handler.pre_tool_use_payload(&ToolInvocation {
@@ -339,7 +302,8 @@ mod tests {
             arguments: json!({ "message": "hello" }).to_string(),
         };
         let (session, turn) = make_session_and_context().await;
-        let handler = McpHandler::new(tool_info("foo", "mcp__foo__", "exec_command"));
+        let handler = McpHandler::new(tool_info("foo", "mcp__foo__", "exec_command"))
+            .expect("MCP tool spec should build");
 
         let invocation = handler
             .with_updated_hook_input(
@@ -388,7 +352,8 @@ mod tests {
             truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1024),
         };
         let (session, turn) = make_session_and_context().await;
-        let handler = McpHandler::new(tool_info("filesystem", "mcp__filesystem__", "read_file"));
+        let handler = McpHandler::new(tool_info("filesystem", "mcp__filesystem__", "read_file"))
+            .expect("MCP tool spec should build");
         let invocation = ToolInvocation {
             session: session.into(),
             turn: turn.into(),
@@ -421,8 +386,41 @@ mod tests {
     }
 
     #[test]
-    fn mcp_hook_tool_input_defaults_empty_args_to_object() {
-        assert_eq!(mcp_hook_tool_input("  "), json!({}));
+    fn mcp_read_only_hint_supports_parallel_calls_without_server_opt_in() {
+        let mut read_only_info = tool_info("foo", "mcp__foo__", "read");
+        read_only_info.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+
+        assert!(
+            McpHandler::new(read_only_info)
+                .expect("MCP tool spec should build")
+                .supports_parallel_tool_calls()
+        );
+    }
+
+    #[test]
+    fn mcp_parallel_calls_require_read_only_hint_or_server_opt_in() {
+        let missing_hint_info = tool_info("foo", "mcp__foo__", "unannotated");
+        assert!(
+            !McpHandler::new(missing_hint_info)
+                .expect("MCP tool spec should build")
+                .supports_parallel_tool_calls()
+        );
+
+        let mut writable_info = tool_info("foo", "mcp__foo__", "write");
+        writable_info.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(false));
+        assert!(
+            !McpHandler::new(writable_info)
+                .expect("MCP tool spec should build")
+                .supports_parallel_tool_calls()
+        );
+
+        let mut server_opt_in_info = tool_info("foo", "mcp__foo__", "server_opt_in");
+        server_opt_in_info.supports_parallel_tool_calls = true;
+        assert!(
+            McpHandler::new(server_opt_in_info)
+                .expect("MCP tool spec should build")
+                .supports_parallel_tool_calls()
+        );
     }
 
     fn tool_info(server_name: &str, callable_namespace: &str, tool_name: &str) -> ToolInfo {
