@@ -244,15 +244,71 @@ Per the user's direction this merge does NOT rebuild the sidecar or touch
 4. Smoke test the apply_patch path on a chat-wire provider (DeepSeek is the
    reference).
 
+## Post-merge test-code drift (commit `62fa36a217`)
+
+`cargo check --workspace` passed cleanly after the merge commit but
+`cargo test --workspace --no-run` surfaced a second wave of drift —
+test fixtures that were referencing upstream-changed shapes. None of
+these required design judgment, just mechanical alignment with
+upstream's new field set:
+
+- `codex-api/src/requests/chat.rs` (Tea's chat-wire builder tests):
+  - `ChatRequestBuilder::build()` now takes `ChatDialect` by value,
+    not `&Provider`. Replaced the `provider()` helper with
+    `ChatDialect::Strict`.
+  - `ResponseItem::Message` no longer has `end_turn` — dropped from
+    fixtures.
+  - `ResponseItem::FunctionCall` gained a `namespace: Option<String>`
+    field — added `namespace: None`.
+  - `FunctionCallOutputPayload` reshape from `{ content: String, … }`
+    to `{ body: FunctionCallOutputBody, success: Option<bool> }` —
+    fixtures updated to `body: FunctionCallOutputBody::Text(...)`.
+
+- 13 `ModelProviderInfo` struct literals across these crates were
+  missing the Tea-fork `openai_chat_dialect` field. Default
+  `OpenAiChatDialect::Strict` added to each:
+  - `model-provider-info/src/model_provider_info_tests.rs` (6 spots)
+  - `model-provider/src/provider.rs` (1)
+  - `config/src/thread_config.rs` (1)
+  - `config/src/thread_config/remote.rs` (1)
+  - `core/tests/suite/client.rs` (4)
+  - `core/tests/suite/client_websockets.rs` (1)
+  - `core/tests/responses_headers.rs` (3)
+  - `core/tests/suite/stream_error_allows_next_turn.rs` (1)
+  - `core/tests/suite/stream_no_completed.rs` (1)
+  - `core/src/compact_tests.rs` (1)
+  - `login/src/auth_env_telemetry.rs` (1)
+  - `app-server/src/request_processors/thread_processor_tests.rs` (1)
+
+- `config/src/thread_config/remote.rs` proto round-trip:
+  - Destructure pattern now acknowledges `openai_chat_dialect`
+    (discarded — proto wire schema currently doesn't carry the
+    dialect signal).
+  - `proto_wire_api(WireApi::Chat)` panics with an explicit
+    "cannot round-trip through proto" message. Proto's `WireApi`
+    enum only has `WIRE_API_RESPONSES`; until upstream adds
+    `WIRE_API_CHAT`, chat-wire providers are local-only and
+    cannot be synced via remote thread_config.
+
+- `core/src/tools/router_tests.rs` — Tea's
+  `build_model_tool_call_resolves_flat_chat_namespace_alias` test was
+  the last call site of the deleted `from_config(&ToolsConfig, …)`
+  API. Ported to upstream's `from_turn_context(&TurnContext, …)`. The
+  chat-flat-name alias map is now derived in `ToolRouter::from_parts`
+  (see resolution #4), so the same code path is still exercised.
+
 ## Validation status (this merge)
 
 - `cargo check --workspace` — clean (1 unrelated warning in
   `codex-model-provider-info` about an unused `CHAT_WIRE_API_REMOVED_ERROR`
   constant; pre-existing and not from this merge).
+- `cargo test --workspace --no-run` — clean after commit `62fa36a217`.
 - `cargo fmt` (via `just fmt`) — applied, captured in commit `14b9d62bb6`.
-- `cargo build --workspace`, `cargo test --workspace`, `cargo clippy
-  --workspace --all-targets` — running. Outcome documented in the final
-  handoff.
+  `just fmt` also tries to run `uv run ruff` over `sdk/python`; that step
+  fails locally because `uv` is not installed. Out of scope for this
+  Rust-only merge.
+- `cargo test --workspace`, `cargo clippy --workspace --all-targets` —
+  running. Outcome documented in the final handoff.
 
 ## Branches
 
