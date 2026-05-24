@@ -174,8 +174,13 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
 #[tokio::test]
 async fn build_model_tool_call_resolves_flat_chat_namespace_alias() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
-    let router = ToolRouter::from_config(
-        &turn.tools_config,
+    // codex-tea fork: 上游 #22835 之后 router 从 TurnContext 派生（不再吃
+    // ToolsConfig），且 ToolRouterParams 字段也调整了——`unavailable_called_tools`
+    // 没了、`extension_tool_bundles` 改成 `extension_tool_executors`。chat-wire
+    // flat-name 反解逻辑现在由 `from_parts` 自动从 model_visible_specs 派生，
+    // 测试覆盖的能力没变。
+    let router = ToolRouter::from_turn_context(
+        &turn,
         ToolRouterParams {
             deferred_mcp_tools: None,
             mcp_tools: Some(vec![mcp_tool_info(
@@ -184,9 +189,8 @@ async fn build_model_tool_call_resolves_flat_chat_namespace_alias() -> anyhow::R
                 "mcp__codex_apps__calendar",
                 "_create_event",
             )]),
-            unavailable_called_tools: Vec::new(),
             discoverable_tools: None,
-            extension_tool_bundles: Vec::new(),
+            extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
     );

@@ -215,6 +215,9 @@ fn model_provider_to_proto(
         websocket_connect_timeout_ms,
         requires_openai_auth,
         supports_websockets,
+        // codex-tea fork: chat 方言只在本地 model_provider_info 解析时使用，
+        // 不进入 remote thread_config proto。
+        openai_chat_dialect: _,
     } = provider;
 
     proto::ModelProvider {
@@ -287,6 +290,12 @@ fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
+        // codex-tea fork: 本地 chat-wire provider 暂不进入 remote thread_config
+        // proto（proto 没有 WIRE_API_CHAT 枚举）。如果将来要把 chat provider
+        // 推到 remote，需要先在 proto 加上 WIRE_API_CHAT 再来扩这条 arm。
+        WireApi::Chat => unreachable!(
+            "chat-wire providers cannot round-trip through remote thread_config proto"
+        ),
     }
 }
 
@@ -516,6 +525,8 @@ mod tests {
             requires_openai_auth: false,
             supports_websockets: true,
             aws: None,
+            // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
+            openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
         }
     }
 

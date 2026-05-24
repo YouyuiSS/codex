@@ -2077,6 +2077,8 @@ fn websocket_provider_with_connect_timeout(
         websocket_connect_timeout_ms,
         requires_openai_auth: false,
         supports_websockets: true,
+        // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
+        openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
     }
 }
 

@@ -434,33 +434,19 @@ fn push_tool_call_message(
 
 #[cfg(test)]
 mod tests {
+    // codex-tea fork: 测试在 merge upstream/main 后做了同步——上游 `Provider`
+    // 删去 `wire` 字段、`ResponseItem::Message` 删掉 `end_turn`、
+    // `ResponseItem::FunctionCall` 新增 `namespace`、`FunctionCallOutputPayload`
+    // 由 `content: String` 改为 `body: FunctionCallOutputBody`，且
+    // `ChatRequestBuilder::build` 现在收 `ChatDialect`（值）而不是 `&Provider`。
     use super::*;
-    use crate::provider::RetryConfig;
-    use crate::provider::WireApi;
+    use crate::provider::ChatDialect;
+    use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
-    use std::time::Duration;
-
-    fn provider() -> Provider {
-        Provider {
-            name: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            query_params: None,
-            wire: WireApi::Chat,
-            headers: HeaderMap::new(),
-            retry: RetryConfig {
-                max_attempts: 1,
-                base_delay: Duration::from_millis(10),
-                retry_429: false,
-                retry_5xx: true,
-                retry_transport: true,
-            },
-            stream_idle_timeout: Duration::from_secs(1),
-        }
-    }
 
     #[test]
     fn attaches_conversation_and_subagent_headers() {
@@ -470,13 +456,12 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "hi".to_string(),
             }],
-            end_turn: None,
             phase: None,
         }];
         let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
             .conversation_id(Some("conv-1".into()))
             .session_source(Some(SessionSource::SubAgent(SubAgentSource::Review)))
-            .build(&provider())
+            .build(ChatDialect::Strict)
             .expect("request");
 
         assert_eq!(
@@ -498,52 +483,54 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "read these".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
                 id: None,
                 name: "read_file".to_string(),
+                namespace: None,
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
                 call_id: "call-a".to_string(),
             },
             ResponseItem::FunctionCall {
                 id: None,
                 name: "read_file".to_string(),
+                namespace: None,
                 arguments: r#"{"path":"b.txt"}"#.to_string(),
                 call_id: "call-b".to_string(),
             },
             ResponseItem::FunctionCall {
                 id: None,
                 name: "read_file".to_string(),
+                namespace: None,
                 arguments: r#"{"path":"c.txt"}"#.to_string(),
                 call_id: "call-c".to_string(),
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-a".to_string(),
                 output: FunctionCallOutputPayload {
-                    content: "A".to_string(),
-                    ..Default::default()
+                    body: FunctionCallOutputBody::Text("A".to_string()),
+                    success: None,
                 },
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-b".to_string(),
                 output: FunctionCallOutputPayload {
-                    content: "B".to_string(),
-                    ..Default::default()
+                    body: FunctionCallOutputBody::Text("B".to_string()),
+                    success: None,
                 },
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-c".to_string(),
                 output: FunctionCallOutputPayload {
-                    content: "C".to_string(),
-                    ..Default::default()
+                    body: FunctionCallOutputBody::Text("C".to_string()),
+                    success: None,
                 },
             },
         ];
 
         let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
-            .build(&provider())
+            .build(ChatDialect::Strict)
             .expect("request");
 
         let messages = req
