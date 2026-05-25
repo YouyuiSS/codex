@@ -112,18 +112,10 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
     assert_eq!(expected_provider, provider);
 }
 
-#[test]
-fn test_deserialize_chat_wire_api_shows_helpful_error() {
-    let provider_toml = r#"
-name = "OpenAI using Chat Completions"
-base_url = "https://api.openai.com/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "chat"
-        "#;
-
-    let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
-}
+// codex-tea fork: 删了上游 `test_deserialize_chat_wire_api_shows_helpful_error`
+// 测试。该测试断言 `wire_api = "chat"` 反序列化失败并带 CHAT_WIRE_API_REMOVED_ERROR
+// 错误信息。Tea 在 a19e198d94 之后已 revive 了 WireApi::Chat（让 chat-wire
+// provider 重新可用），那个测试现在必然 panic on Result::unwrap_err。
 
 #[test]
 fn test_deserialize_websocket_connect_timeout() {

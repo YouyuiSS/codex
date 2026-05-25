@@ -464,8 +464,11 @@ mod tests {
             .build(ChatDialect::Strict)
             .expect("request");
 
+        // codex-tea fork: header 键以 `-` 连接（HTTP header 命名约定）；
+        // build_session_headers 在 headers.rs 用的是 "session-id" 而不是
+        // "session_id"。修正测试断言的字面值。
         assert_eq!(
-            req.headers.get("session_id"),
+            req.headers.get("session-id"),
             Some(&HeaderValue::from_static("conv-1"))
         );
         assert_eq!(

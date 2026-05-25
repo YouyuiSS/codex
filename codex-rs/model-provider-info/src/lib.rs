@@ -43,7 +43,11 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+// codex-tea fork: 上游 #10157 (d2394a2494) 移除了 `wire_api = "chat"` 并新增
+// 了 CHAT_WIRE_API_REMOVED_ERROR 常量 + 对应的 deserialize-fail 测试。本 fork
+// 在 a19e198d94 之后 **revived** `WireApi::Chat`，所以那个错误常量永远走不到，
+// 配套测试 (`test_deserialize_chat_wire_api_shows_helpful_error`) 也会
+// 100% panic on Result::unwrap_err。常量和测试都已删除。
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -93,6 +97,12 @@ impl OpenAiChatDialect {
             Self::Strict => ApiChatDialect::Strict,
             Self::ThinkingReasoningContent => ApiChatDialect::ThinkingReasoningContent,
         }
+    }
+
+    /// 用于 `#[serde(skip_serializing_if = ...)]`：默认值 (Strict) 序列化时跳
+    /// 过该字段，保证旧 TOML/JSON 比较不会因为字段出现而失败。
+    pub fn is_strict(&self) -> bool {
+        matches!(self, Self::Strict)
     }
 }
 
@@ -184,7 +194,9 @@ pub struct ModelProviderInfo {
     ///
     /// 默认 `Strict`（OpenAI 原生）。Tea 桌面端在注入 model_providers 时按
     /// provider 类型显式设置（DeepSeek/GLM/Qwen 设为 `ThinkingReasoningContent`）。
-    #[serde(default)]
+    /// `skip_serializing_if = is_strict` 让默认值不写进 TOML/JSON，保持与
+    /// 旧测试 fixtures（不含该字段）的等价比较。
+    #[serde(default, skip_serializing_if = "OpenAiChatDialect::is_strict")]
     pub openai_chat_dialect: OpenAiChatDialect,
 }
 
