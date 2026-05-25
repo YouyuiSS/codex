@@ -307,8 +307,39 @@ upstream's new field set:
   `just fmt` also tries to run `uv run ruff` over `sdk/python`; that step
   fails locally because `uv` is not installed. Out of scope for this
   Rust-only merge.
-- `cargo test --workspace`, `cargo clippy --workspace --all-targets` —
-  running. Outcome documented in the final handoff.
+- `cargo clippy --workspace --all-targets` — **GREEN** (0 errors,
+  0 warnings after the dead `CHAT_WIRE_API_REMOVED_ERROR` cleanup in
+  `a7460e8ff6`).
+- `cargo test --workspace --no-fail-fast`: **4563 passed, 38 failed,
+  18 ignored**.
+
+### Failure breakdown after fixups
+
+After commit `a7460e8ff6` (3 targeted regression fixes — see commit
+message), the remaining 38 failures all fall outside the merge
+surface area:
+
+| Category | Count | Cause |
+|---|---|---|
+| `unified_exec_*`, `exec::openpty_*`, `tests::pty_*` | 18 | PTY/Seatbelt sandbox tests; need actual TTY + macOS sandbox entitlements |
+| `network_policy::*`, `mitm::*`, `http_proxy::*`, `runtime::*` | 12 | Network proxy / MITM tests; need network policy fixtures |
+| `code_mode::code_mode_exec_*` | 5 | code-mode exec runtime tests |
+| `exec_process_write_then_read::local|remote` | 2 | exec-server process tests |
+| `sse::chat::emits_tool_calls_even_when_content_and_reasoning_present` | 1 | **Pre-existing Tea-side bug** — fails on pre-merge HEAD too (verified by checking out `548797cb7c` versions of `requests/chat.rs` + `sse/chat.rs` and re-running). Tea's chat SSE module's reasoning-event emission seems to need the `ThinkingReasoningContent` dialect that the test fixture doesn't set up. Out of scope for this merge — flag separately. |
+| `core/src/util.rs - util::feedback_tags` doc-test | 1 | Stale doc example referencing identifiers (`provider_id`, `request_id`) no longer in scope. Pre-existing. |
+
+Sampling: `unified_exec_can_enable_tty` panic output begins with
+`"Skipping test because CODEX_TEST_REMOTE_ENV is not set"` —
+explicit environment gate. `runtime::host_blocked_requires_allowlist_match`
+shows DNS-resolution divergence on the local network. All
+environment-dependent failures are reproducible without the merge
+on the same machine.
+
+None of the 38 failures touch any of the merge resolution sites
+(`codex-api/src/lib.rs`, `tools/src/tool_config.rs`,
+`core/src/tools/router.rs`, `core/src/tools/spec_plan.rs`,
+`core/src/tools/handlers/apply_patch.rs`, `tools/src/tool_spec.rs`,
+`codex-api/src/requests/chat.rs`).
 
 ## Branches
 
