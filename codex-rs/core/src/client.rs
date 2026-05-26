@@ -1385,6 +1385,16 @@ impl ModelClientSession {
                 .openai_chat_dialect
                 .to_api_dialect();
 
+            // codex-tea fork: provider-level Chat Completions 顶层 body
+            // 扩展字段（如 `chat_template_kwargs.enable_thinking=false`）。
+            // 桌面端通过 `model_providers.<key>.extra_body` 配置；core
+            // 这里只把它取出来按引用传给 ChatRequestBuilder。Responses
+            // 路径完全不读这个字段。详见
+            // docs/design/desktop_provider_extra_body_design.md。
+            let provider_info = self.client.state.provider.info();
+            let provider_name = provider_info.name.as_str();
+            let provider_extra_body = provider_info.extra_body.as_ref();
+
             // Build the chat-completions request body.
             let instructions = prompt.base_instructions.text.clone();
             let input = prompt.get_formatted_input();
@@ -1393,6 +1403,8 @@ impl ModelClientSession {
             let request = ChatRequestBuilder::new(&model_info.slug, &instructions, &input, &tools)
                 .conversation_id(Some(self.client.state.thread_id.to_string()))
                 .session_source(Some(self.client.state.session_source.clone()))
+                .provider_name(provider_name)
+                .extra_body(provider_extra_body)
                 .build(chat_dialect)
                 .map_err(map_api_error)?;
 

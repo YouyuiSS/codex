@@ -867,6 +867,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         supports_websockets: false,
         // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
         openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -2302,6 +2303,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         supports_websockets: false,
         // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
         openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -2910,6 +2912,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         supports_websockets: false,
         // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
         openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     // Init session
@@ -3001,6 +3004,7 @@ async fn env_var_overrides_loaded_auth() {
         supports_websockets: false,
         // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
         openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     // Init session

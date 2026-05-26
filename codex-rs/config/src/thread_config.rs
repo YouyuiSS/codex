@@ -315,6 +315,8 @@ mod tests {
             supports_websockets: true,
             // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
             openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+            // codex-tea fork: 测试 fixture 默认不带 extra_body。
+            extra_body: None,
         }
     }
 }

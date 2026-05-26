@@ -188,6 +188,10 @@ fn model_provider_from_proto(
         // 携带方言字段；缺省 Strict 即可，桌面端通过 config.toml 注入的
         // model_providers 才是 thinking provider 的源头。
         openai_chat_dialect: Default::default(),
+        // 同上：Remote thread config 协议没有 extra_body 通道。桌面端
+        // 通过 thread/start 的 model_providers 注入 extra_body；走 remote
+        // thread config 这条路径的 codex CLI 用户不需要该字段。
+        extra_body: None,
     };
     Ok((id, info))
 }
@@ -218,6 +222,9 @@ fn model_provider_to_proto(
         // codex-tea fork: chat 方言只在本地 model_provider_info 解析时使用，
         // 不进入 remote thread_config proto。
         openai_chat_dialect: _,
+        // codex-tea fork: provider extra_body 通过桌面端 thread/start
+        // 的 model_providers 注入；remote thread config proto 当前不携带。
+        extra_body: _,
     } = provider;
 
     proto::ModelProvider {
@@ -293,9 +300,9 @@ fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
         // codex-tea fork: 本地 chat-wire provider 暂不进入 remote thread_config
         // proto（proto 没有 WIRE_API_CHAT 枚举）。如果将来要把 chat provider
         // 推到 remote，需要先在 proto 加上 WIRE_API_CHAT 再来扩这条 arm。
-        WireApi::Chat => unreachable!(
-            "chat-wire providers cannot round-trip through remote thread_config proto"
-        ),
+        WireApi::Chat => {
+            unreachable!("chat-wire providers cannot round-trip through remote thread_config proto")
+        }
     }
 }
 
@@ -527,6 +534,8 @@ mod tests {
             aws: None,
             // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
             openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+            // codex-tea fork: Remote thread config 协议不携带 extra_body。
+            extra_body: None,
         }
     }
 

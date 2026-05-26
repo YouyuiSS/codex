@@ -237,6 +237,7 @@ fn should_use_remote_compact_task_for_azure_provider() {
         supports_websockets: false,
         // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
         openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     assert!(should_use_remote_compact_task(&provider));

@@ -11,7 +11,9 @@ use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Assembled request body plus headers for Chat Completions streaming calls.
 pub struct ChatRequest {
@@ -26,6 +28,14 @@ pub struct ChatRequestBuilder<'a> {
     tools: &'a [Value],
     conversation_id: Option<String>,
     session_source: Option<SessionSource>,
+    /// codex-tea fork: 用于 `extra_body` collision warn 时记录 provider
+    /// 名，便于在 sidecar 日志里定位是哪条 admin 配置错配。空串表示
+    /// 调用方没注入，merge 内不会引用它（只在命中保护字段时才打 warn）。
+    provider_name: &'a str,
+    /// codex-tea fork: provider-level Chat Completions 顶层 body 扩展字段。
+    /// 由 core client 从 `ModelProviderInfo.extra_body` 读取并传入；
+    /// `None` / 空 map 都不改变出站 body。
+    extra_body: Option<&'a BTreeMap<String, Value>>,
 }
 
 impl<'a> ChatRequestBuilder<'a> {
@@ -42,6 +52,8 @@ impl<'a> ChatRequestBuilder<'a> {
             tools,
             conversation_id: None,
             session_source: None,
+            provider_name: "",
+            extra_body: None,
         }
     }
 
@@ -52,6 +64,21 @@ impl<'a> ChatRequestBuilder<'a> {
 
     pub fn session_source(mut self, source: Option<SessionSource>) -> Self {
         self.session_source = source;
+        self
+    }
+
+    /// codex-tea fork: 设置 provider 显示名。仅用于 `extra_body` collision
+    /// warn 时附带 provider 标识，便于 admin 在 sidecar 日志里定位错配。
+    pub fn provider_name(mut self, name: &'a str) -> Self {
+        self.provider_name = name;
+        self
+    }
+
+    /// codex-tea fork: 注入 provider-level Chat Completions 顶层 body
+    /// 扩展字段。具体语义、保护字段、collision 规则见
+    /// `merge_provider_extra_body` 与 `docs/design/desktop_provider_extra_body_design.md`。
+    pub fn extra_body(mut self, extra: Option<&'a BTreeMap<String, Value>>) -> Self {
+        self.extra_body = extra;
         self
     }
 
@@ -357,12 +384,18 @@ impl<'a> ChatRequestBuilder<'a> {
             }
         }
 
-        let payload = json!({
+        let mut payload = json!({
             "model": self.model,
             "messages": messages,
             "stream": true,
             "tools": self.tools,
         });
+
+        // codex-tea fork: provider-level Chat Completions 顶层 body 扩展
+        // 字段。必须在 TEA_CHAT_REQ_TRACE 输出之前 merge，否则诊断日志
+        // 会丢掉真实出站 body。详见 merge_provider_extra_body 注释 +
+        // docs/design/desktop_provider_extra_body_design.md。
+        merge_provider_extra_body(&mut payload, self.provider_name, self.extra_body);
 
         // 诊断开关：设置 TEA_CHAT_REQ_TRACE=1 时把出站请求 body 打到 stderr，
         // 用于排查 messages 列表里 reasoning_content 字段实际形态。
@@ -385,6 +418,76 @@ impl<'a> ChatRequestBuilder<'a> {
             body: payload,
             headers,
         })
+    }
+}
+
+/// codex-tea fork: codex-rs 自己组装的 Chat Completions 顶层字段。
+///
+/// 这份列表与 `merge_provider_extra_body` 一起守住一条边界：admin 在
+/// `model_providers.<key>.extra_body` 里写的任何键，**不允许**覆盖这些
+/// 字段——否则一条错配就能让 codex-rs 的请求构造逻辑失效。
+///
+/// 列表必须与 Tea backend (`AiModelConfigService.java`) 的同名常量保持
+/// 等价：桌面端 sidecar 与 backend sandbox 必须看到一样的保护边界，
+/// 否则一条 admin 配置在两条路径上行为分裂，会非常难排查。
+const RESERVED_EXTRA_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "stream",
+    "stream_options",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "response_format",
+    "reasoning",
+    "reasoning_effort",
+];
+
+/// codex-tea fork: 把 provider-level `extra_body` merge 进 Chat Completions
+/// 出站 payload 的顶层。
+///
+/// 规则（详见 `docs/design/desktop_provider_extra_body_design.md` §5）：
+/// - `extra == None` 或空 map：不改变 payload。
+/// - key 命中 `RESERVED_EXTRA_BODY_KEYS`：`warn!` 记录并 skip。**不**
+///   返回 error——admin 错配不应让 sidecar 启动失败或 thread/start RPC
+///   失败；warn 进 sidecar 日志，事后定位即可。
+/// - 其它 key：原样写入顶层；若键已存在（理论上不会，core 自己组装
+///   的字段都在保护列表里），覆盖之。
+///
+/// 调用方必须传入 `payload` 已经是 JSON object 的 `Value::Object`；这是
+/// `build()` 内 `json!({...})` 的形态。`debug_assert!` 兜底。
+fn merge_provider_extra_body(
+    payload: &mut Value,
+    provider_name: &str,
+    extra: Option<&BTreeMap<String, Value>>,
+) {
+    let Some(extra) = extra else {
+        return;
+    };
+    if extra.is_empty() {
+        return;
+    }
+
+    let Some(obj) = payload.as_object_mut() else {
+        debug_assert!(false, "chat payload should be a JSON object");
+        return;
+    };
+
+    for (key, value) in extra {
+        if RESERVED_EXTRA_BODY_KEYS.contains(&key.as_str()) {
+            warn!(
+                target = "chat_req",
+                provider = %provider_name,
+                key = %key,
+                "provider extra_body key collides with reserved chat request field; skipping",
+            );
+            continue;
+        }
+        obj.insert(key.clone(), value.clone());
     }
 }
 
@@ -564,5 +667,130 @@ mod tests {
         assert_eq!(messages[4]["tool_call_id"], "call-b");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call-c");
+    }
+
+    // codex-tea fork: extra_body merge 测试。
+    //
+    // 用一个最小 user-only prompt 跑 build()，检查 payload 顶层字段是
+    // 否按预期注入 / 跳过。`provider_name` 只用于 collision warn，
+    // 与 payload 值无关，所以测试不展开断言。
+
+    fn minimal_prompt_input() -> Vec<ResponseItem> {
+        vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hi".to_string(),
+            }],
+            phase: None,
+        }]
+    }
+
+    #[test]
+    fn extra_body_none_leaves_payload_unchanged() {
+        let prompt_input = minimal_prompt_input();
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        let obj = req.body.as_object().expect("payload should be object");
+        assert!(!obj.contains_key("chat_template_kwargs"));
+        // sanity: 仍然只含 codex-rs 自己组装的核心字段。
+        assert_eq!(obj.len(), 4);
+    }
+
+    #[test]
+    fn extra_body_empty_map_leaves_payload_unchanged() {
+        let prompt_input = minimal_prompt_input();
+        let empty: BTreeMap<String, Value> = BTreeMap::new();
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .provider_name("GLM")
+            .extra_body(Some(&empty))
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        let obj = req.body.as_object().expect("payload should be object");
+        assert_eq!(obj.len(), 4);
+        assert!(!obj.contains_key("chat_template_kwargs"));
+    }
+
+    #[test]
+    fn extra_body_chat_template_kwargs_merges_into_top_level() {
+        let prompt_input = minimal_prompt_input();
+        let mut extra: BTreeMap<String, Value> = BTreeMap::new();
+        extra.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "enable_thinking": false }),
+        );
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .provider_name("GLM")
+            .extra_body(Some(&extra))
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        assert_eq!(
+            req.body
+                .get("chat_template_kwargs")
+                .and_then(|v| v.get("enable_thinking")),
+            Some(&json!(false))
+        );
+        // 既有字段保留。
+        assert_eq!(req.body.get("model"), Some(&json!("gpt-test")));
+        assert!(req.body.get("messages").is_some());
+        assert_eq!(req.body.get("stream"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn extra_body_reserved_keys_are_skipped_not_overwritten() {
+        let prompt_input = minimal_prompt_input();
+        // 同时混 reserved key 与合法 key：reserved 应 skip，合法 key
+        // 仍能进入 payload。
+        let mut extra: BTreeMap<String, Value> = BTreeMap::new();
+        extra.insert("model".to_string(), json!("hijacked-model"));
+        extra.insert("messages".to_string(), json!(["evil"]));
+        extra.insert("temperature".to_string(), json!(0.0));
+        extra.insert("response_format".to_string(), json!({ "type": "json" }));
+        extra.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "enable_thinking": false }),
+        );
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .provider_name("GLM")
+            .extra_body(Some(&extra))
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        // 保护字段未被覆盖。
+        assert_eq!(req.body.get("model"), Some(&json!("gpt-test")));
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        assert!(
+            messages.len() >= 2,
+            "messages should still be codex-rs-built"
+        );
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            req.body
+                .as_object()
+                .is_some_and(|o| !o.contains_key("temperature"))
+        );
+        assert!(
+            req.body
+                .as_object()
+                .is_some_and(|o| !o.contains_key("response_format"))
+        );
+        // 合法字段写入成功。
+        assert_eq!(
+            req.body
+                .get("chat_template_kwargs")
+                .and_then(|v| v.get("enable_thinking")),
+            Some(&json!(false))
+        );
     }
 }

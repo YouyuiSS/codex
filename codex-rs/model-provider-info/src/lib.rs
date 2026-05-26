@@ -20,6 +20,7 @@ use http::header::HeaderValue;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
@@ -198,6 +199,23 @@ pub struct ModelProviderInfo {
     /// 旧测试 fixtures（不含该字段）的等价比较。
     #[serde(default, skip_serializing_if = "OpenAiChatDialect::is_strict")]
     pub openai_chat_dialect: OpenAiChatDialect,
+
+    /// codex-tea: OpenAI-compatible provider 的 Chat Completions 顶层 body
+    /// 扩展字段。仅 `wire_api == Chat` 时由 chat-wire 模块消费；
+    /// `Responses` 路径忽略此字段。
+    ///
+    /// 用于承载 `chat_template_kwargs`、`options` 等 provider-specific 字段，
+    /// 不能覆盖 codex-rs 自己组装的核心请求字段——`merge_provider_extra_body`
+    /// 维护一份 RESERVED_KEYS 列表（model / messages / tools / tool_choice /
+    /// stream / stream_options / temperature / top_p / max_tokens /
+    /// max_completion_tokens / n / response_format / reasoning /
+    /// reasoning_effort），命中的 key 一律 skip 并 warn，不会因为 admin
+    /// 错配让 sidecar 启动失败。
+    ///
+    /// 用 `BTreeMap` 保证序列化顺序稳定，避免 schemars / TOML round-trip
+    /// 测试 diff 不可重现。`None` 与空 map 等价——不改变出站 body。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// AWS SigV4 auth configuration for a model provider.
@@ -415,6 +433,7 @@ impl ModelProviderInfo {
             requires_openai_auth: true,
             supports_websockets: true,
             openai_chat_dialect: OpenAiChatDialect::Strict,
+            extra_body: None,
         }
     }
 
@@ -446,6 +465,7 @@ impl ModelProviderInfo {
             requires_openai_auth: false,
             supports_websockets: false,
             openai_chat_dialect: OpenAiChatDialect::Strict,
+            extra_body: None,
         }
     }
 
@@ -578,6 +598,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         requires_openai_auth: false,
         supports_websockets: false,
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     }
 }
 

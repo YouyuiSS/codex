@@ -588,6 +588,7 @@ mod thread_processor_behavior_tests {
             supports_websockets: true,
             // codex-tea fork: 默认 Strict = OpenAI 原生 chat 方言。
             openai_chat_dialect: codex_model_provider_info::OpenAiChatDialect::Strict,
+            extra_body: None,
         };
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),

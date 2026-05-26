@@ -1445,6 +1445,11 @@
           "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
           "type": "string"
         },
+        "extra_body": {
+          "additionalProperties": true,
+          "description": "codex-tea: OpenAI-compatible provider 的 Chat Completions 顶层 body 扩展字段。仅 `wire_api == Chat` 时由 chat-wire 模块消费； `Responses` 路径忽略此字段。\n\n用于承载 `chat_template_kwargs`、`options` 等 provider-specific 字段， 不能覆盖 codex-rs 自己组装的核心请求字段——`merge_provider_extra_body` 维护一份 RESERVED_KEYS 列表（model / messages / tools / tool_choice / stream / stream_options / temperature / top_p / max_tokens / max_completion_tokens / n / response_format / reasoning / reasoning_effort），命中的 key 一律 skip 并 warn，不会因为 admin 错配让 sidecar 启动失败。\n\n用 `BTreeMap` 保证序列化顺序稳定，避免 schemars / TOML round-trip 测试 diff 不可重现。`None` 与空 map 等价——不改变出站 body。",
+          "type": "object"
+        },
         "http_headers": {
           "additionalProperties": {
             "type": "string"
@@ -1456,6 +1461,14 @@
           "default": "",
           "description": "Friendly display name.",
           "type": "string"
+        },
+        "openai_chat_dialect": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatDialect"
+            }
+          ],
+          "description": "codex-tea: 选定 OpenAI Chat Completions 方言。仅当 `wire_api == Chat` 时由 chat-wire 模块消费；`Responses` 路径忽略此字段。\n\n默认 `Strict`（OpenAI 原生）。Tea 桌面端在注入 model_providers 时按 provider 类型显式设置（DeepSeek/GLM/Qwen 设为 `ThinkingReasoningContent`）。 `skip_serializing_if = is_strict` 让默认值不写进 TOML/JSON，保持与 旧测试 fixtures（不含该字段）的等价比较。"
         },
         "query_params": {
           "additionalProperties": {
@@ -1931,6 +1944,25 @@
           "description": "Keyring when available, otherwise fail.",
           "enum": [
             "keyring"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OpenAiChatDialect": {
+      "description": "OpenAI Chat Completions 的方言。\n\n设计基线：**OpenAI 原生 Chat Completions 是规范**。野鸡 OpenAI-compat provider（DeepSeek v4 thinking、GLM-4.5、Qwen3-thinking …）在标准外加字段 时，在这里枚举一种 dialect，并在 chat-wire 模块的 in / out 边界 `match dialect` 加一条分支。**不抽 trait / 插件框架**，差异爆炸再说。\n\n这是个 codex-tea 自维护字段，跟 upstream `ModelProviderInfo` 演进解耦 （`#[serde(default)]` 保证 upstream 不写该字段也能反序列化）。",
+      "oneOf": [
+        {
+          "description": "OpenAI 原生 Chat Completions。严格标准：不读不写 reasoning_content / reasoning 等 OpenAI 标准外的字段。",
+          "enum": [
+            "strict"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "OpenAI-compatible thinking 模式（DeepSeek v4 thinking、GLM-4.5、 Qwen3-thinking 等）： - 流式 SSE 推 `delta.reasoning_content`； - 下一轮 assistant message 必须原样回传 `reasoning_content` 字段， 否则服务端会硬校验拒收（DeepSeek 实测：\"The `reasoning_content` in the thinking mode must be passed back to the API.\"）。",
+          "enum": [
+            "thinking_reasoning_content"
           ],
           "type": "string"
         }
@@ -4121,6 +4153,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The OpenAI-compatible Chat Completions API at `/v1/chat/completions`. Revived from upstream pre-d2394a2494 for compatibility with providers that don't speak the Responses protocol (DeepSeek, Anthropic, etc).",
+          "enum": [
+            "chat"
           ],
           "type": "string"
         }

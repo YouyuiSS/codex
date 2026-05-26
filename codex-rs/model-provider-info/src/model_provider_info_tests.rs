@@ -31,6 +31,7 @@ base_url = "http://localhost:11434/v1"
         supports_websockets: false,
         // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -67,6 +68,7 @@ query_params = { api-version = "2025-04-01-preview" }
         supports_websockets: false,
         // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -106,6 +108,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         supports_websockets: false,
         // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -159,6 +162,7 @@ fn test_supports_remote_compaction_for_azure_name() {
         supports_websockets: false,
         // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     assert!(provider.supports_remote_compaction());
@@ -186,6 +190,7 @@ fn test_supports_remote_compaction_for_non_openai_non_azure_provider() {
         supports_websockets: false,
         // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
         openai_chat_dialect: OpenAiChatDialect::Strict,
+        extra_body: None,
     };
 
     assert!(!provider.supports_remote_compaction());
@@ -271,6 +276,7 @@ fn test_create_amazon_bedrock_provider() {
             supports_websockets: false,
             // codex-tea fork: 显式声明 chat-wire 方言（默认 Strict = OpenAI 原生）。
             openai_chat_dialect: OpenAiChatDialect::Strict,
+            extra_body: None,
         }
     );
 }
@@ -459,4 +465,50 @@ refresh_interval_ms = 0
     let auth = provider.auth.expect("auth config should deserialize");
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
+}
+
+// codex-tea fork: 旧 TOML（不含 `extra_body`）必须能反序列化为
+// `extra_body: None`。该回归测试保证桌面端 desktop_provider_extra_body
+// 方案落地后，老配置（没显式写 `extra_body`）不会 schema 校验失败。
+#[test]
+fn test_deserialize_provider_without_extra_body() {
+    let provider_toml = r#"
+name = "Legacy"
+base_url = "https://legacy.example.com/v1"
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+
+    assert_eq!(provider.extra_body, None);
+}
+
+// codex-tea fork: 含 `extra_body` 的 TOML 必须能反序列化并保留嵌套
+// JSON。`chat_template_kwargs.enable_thinking=false` 是桌面端关闭 GLM /
+// 华为类 provider thinking 输出的默认 payload，参见
+// `docs/design/desktop_provider_extra_body_design.md`。
+#[test]
+fn test_deserialize_provider_with_extra_body_chat_template_kwargs() {
+    let provider_toml = r#"
+name = "GLM"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[extra_body.chat_template_kwargs]
+enable_thinking = false
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    let extra_body = provider
+        .extra_body
+        .as_ref()
+        .expect("extra_body should deserialize");
+
+    let kwargs = extra_body
+        .get("chat_template_kwargs")
+        .expect("chat_template_kwargs should be present")
+        .as_object()
+        .expect("chat_template_kwargs should be a JSON object");
+    assert_eq!(
+        kwargs.get("enable_thinking"),
+        Some(&serde_json::json!(false))
+    );
 }
