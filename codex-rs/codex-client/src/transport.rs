@@ -14,6 +14,7 @@ use http::StatusCode;
 use tracing::Level;
 use tracing::enabled;
 use tracing::trace;
+use tracing::warn;
 
 pub type ByteStream = BoxStream<'static, Result<Bytes, TransportError>>;
 
@@ -106,6 +107,18 @@ impl HttpTransport for ReqwestTransport {
         let bytes = resp.bytes().await.map_err(Self::map_error)?;
         if !status.is_success() {
             let body = String::from_utf8(bytes.to_vec()).ok();
+            // codex-tea: 上游不在 transport 层 log HTTP 4xx/5xx，错误只往上抛
+            // 变成 ApiError，最终被 sidecar JSON-RPC 包装后到 UI。如果上层没把
+            // body 透传出来（绝大多数路径都没），诊断时只能看到一句通用错误。
+            // 这里加一行 warn! 把 status / url / body 直接打到 sidecar.log，
+            // 让上游 provider（OpenAI / DeepSeek / GLM / 华为 AI 网关等）真实的
+            // 拒收原因可见，行为不变只加诊断 log，保持 upstream-mergeable。
+            warn!(
+                %status,
+                url = %url,
+                body = body.as_deref().unwrap_or("<non-utf8 or empty>"),
+                "upstream HTTP non-success (execute)"
+            );
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
@@ -137,6 +150,19 @@ impl HttpTransport for ReqwestTransport {
         let headers = resp.headers().clone();
         if !status.is_success() {
             let body = resp.text().await.ok();
+            // codex-tea: chat completions 走 stream() 这一条；HTTP 4xx/5xx 在
+            // 上游协议层（OpenAI / DeepSeek / GLM / 华为 AI 网关等）通常会带
+            // 详尽的 error body（model_not_found / invalid_tools_schema /
+            // context_length_exceeded 等）。上游代码只把它打包成 ApiError 往上
+            // 抛，sidecar.log 看不到。这里加 warn! 把 status / url / body 落盘，
+            // 让 sidecar.log 在 [chat-req-trace] 之后能立刻看到真实拒收原因。
+            // 行为不变只加诊断 log，保持 upstream-mergeable。
+            warn!(
+                %status,
+                url = %url,
+                body = body.as_deref().unwrap_or("<non-utf8 or empty>"),
+                "upstream HTTP non-success (stream)"
+            );
             return Err(TransportError::Http {
                 status,
                 url: Some(url),
