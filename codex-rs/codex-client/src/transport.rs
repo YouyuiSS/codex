@@ -87,6 +87,18 @@ fn request_body_for_trace(req: &Request) -> String {
     }
 }
 
+fn chat_http_trace_enabled() -> bool {
+    std::env::var_os("TEA_CHAT_REQ_TRACE").is_some()
+        || std::env::var_os("TEA_CHAT_HTTP_TRACE").is_some()
+}
+
+fn header_value_for_trace<'a>(headers: &'a HeaderMap, name: http::header::HeaderName) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>")
+}
+
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
@@ -143,11 +155,38 @@ impl HttpTransport for ReqwestTransport {
             );
         }
 
+        let method = req.method.to_string();
         let url = req.url.clone();
+        let trace_chat_http = chat_http_trace_enabled();
         let builder = self.build(req)?;
-        let resp = builder.send().await.map_err(Self::map_error)?;
+        if trace_chat_http {
+            eprintln!("[chat-http-trace] send start method={method} url={url}");
+        }
+        let resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if trace_chat_http {
+                    eprintln!("[chat-http-trace] send error url={url} error={err}");
+                }
+                return Err(Self::map_error(err));
+            }
+        };
         let status = resp.status();
         let headers = resp.headers().clone();
+        if trace_chat_http {
+            let content_type = header_value_for_trace(&headers, http::header::CONTENT_TYPE);
+            let content_length = header_value_for_trace(&headers, http::header::CONTENT_LENGTH);
+            let transfer_encoding =
+                header_value_for_trace(&headers, http::header::TRANSFER_ENCODING);
+            eprintln!(
+                "[chat-http-trace] response headers status={} url={} content_type={} content_length={} transfer_encoding={}",
+                status.as_u16(),
+                url,
+                content_type,
+                content_length,
+                transfer_encoding
+            );
+        }
         if !status.is_success() {
             let body = resp.text().await.ok();
             // codex-tea: chat completions 走 stream() 这一条；HTTP 4xx/5xx 在
@@ -170,9 +209,30 @@ impl HttpTransport for ReqwestTransport {
                 body,
             });
         }
-        let stream = resp
-            .bytes_stream()
-            .map(|result| result.map_err(Self::map_error));
+        let url_for_chunks = url.clone();
+        let mut first_chunk_seen = false;
+        let stream = resp.bytes_stream().map(move |result| {
+            if trace_chat_http {
+                match &result {
+                    Ok(bytes) if !first_chunk_seen => {
+                        first_chunk_seen = true;
+                        eprintln!(
+                            "[chat-http-trace] first byte chunk url={} bytes={}",
+                            url_for_chunks,
+                            bytes.len()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "[chat-http-trace] byte stream error url={} error={}",
+                            url_for_chunks, err
+                        );
+                    }
+                }
+            }
+            result.map_err(Self::map_error)
+        });
         Ok(StreamResponse {
             status,
             headers,
