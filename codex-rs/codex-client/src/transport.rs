@@ -11,6 +11,7 @@ use futures::stream::BoxStream;
 use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
+use serde_json::Value;
 use tracing::Level;
 use tracing::enabled;
 use tracing::trace;
@@ -22,6 +23,16 @@ pub struct StreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub bytes: ByteStream,
+}
+
+#[derive(Debug)]
+struct ChatHttpTraceStats {
+    model: String,
+    body_bytes: usize,
+    messages_count: usize,
+    tools_count: usize,
+    system_chars: usize,
+    user_chars: usize,
 }
 
 #[async_trait]
@@ -99,6 +110,62 @@ fn header_value_for_trace<'a>(headers: &'a HeaderMap, name: http::header::Header
         .unwrap_or("<missing>")
 }
 
+fn text_content_chars(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.chars().count(),
+        Value::Array(items) => items.iter().map(text_content_chars).sum(),
+        Value::Object(map) => map.get("text").map(text_content_chars).unwrap_or(0),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
+fn request_stats_for_trace(req: &Request) -> ChatHttpTraceStats {
+    let mut stats = ChatHttpTraceStats {
+        model: "<missing>".to_string(),
+        body_bytes: 0,
+        messages_count: 0,
+        tools_count: 0,
+        system_chars: 0,
+        user_chars: 0,
+    };
+
+    match req.body.as_ref() {
+        Some(RequestBody::Json(body)) => {
+            stats.body_bytes = serde_json::to_vec(body)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            stats.model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+                .to_string();
+            stats.tools_count = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+                stats.messages_count = messages.len();
+                for message in messages {
+                    let content_chars = message.get("content").map(text_content_chars).unwrap_or(0);
+                    match message.get("role").and_then(Value::as_str) {
+                        Some("system" | "developer") => stats.system_chars += content_chars,
+                        Some("user") => stats.user_chars += content_chars,
+                        Some(_) | None => {}
+                    }
+                }
+            }
+        }
+        Some(RequestBody::Raw(body)) => {
+            stats.model = "<raw>".to_string();
+            stats.body_bytes = body.len();
+        }
+        None => {}
+    }
+
+    stats
+}
+
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
@@ -158,9 +225,22 @@ impl HttpTransport for ReqwestTransport {
         let method = req.method.to_string();
         let url = req.url.clone();
         let trace_chat_http = chat_http_trace_enabled();
+        let trace_stats = trace_chat_http.then(|| request_stats_for_trace(&req));
         let builder = self.build(req)?;
         if trace_chat_http {
-            eprintln!("[chat-http-trace] send start method={method} url={url}");
+            if let Some(stats) = trace_stats.as_ref() {
+                eprintln!(
+                    "[chat-http-trace] send start method={method} url={url} model={} body_bytes={} messages_count={} tools_count={} system_chars={} user_chars={}",
+                    stats.model,
+                    stats.body_bytes,
+                    stats.messages_count,
+                    stats.tools_count,
+                    stats.system_chars,
+                    stats.user_chars
+                );
+            } else {
+                eprintln!("[chat-http-trace] send start method={method} url={url}");
+            }
         }
         let resp = match builder.send().await {
             Ok(resp) => resp,
