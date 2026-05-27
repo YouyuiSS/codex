@@ -384,10 +384,16 @@ impl<'a> ChatRequestBuilder<'a> {
             }
         }
 
+        // `stream_options.include_usage = true` 要求 provider 在流式响应的
+        // 最后一个 chunk 带 `usage` 字段，由 sse/chat.rs 解析后填进
+        // ResponseEvent::Completed.token_usage，让 codex auto-compact 阈值判定
+        // 与 UI 占用展示拿到真实数据。OpenAI Chat Completions 标准字段；
+        // DeepSeek / GLM / Qwen 等 OpenAI-compatible provider 均支持。
         let mut payload = json!({
             "model": self.model,
             "messages": messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
             "tools": self.tools,
         });
 
@@ -695,8 +701,13 @@ mod tests {
 
         let obj = req.body.as_object().expect("payload should be object");
         assert!(!obj.contains_key("chat_template_kwargs"));
-        // sanity: 仍然只含 codex-rs 自己组装的核心字段。
-        assert_eq!(obj.len(), 4);
+        // sanity: 仅含 codex-rs 自己组装的核心字段：
+        // model / messages / stream / stream_options / tools = 5
+        assert_eq!(obj.len(), 5);
+        assert_eq!(
+            obj.get("stream_options"),
+            Some(&json!({ "include_usage": true }))
+        );
     }
 
     #[test]
@@ -710,7 +721,8 @@ mod tests {
             .expect("request");
 
         let obj = req.body.as_object().expect("payload should be object");
-        assert_eq!(obj.len(), 4);
+        // model / messages / stream / stream_options / tools = 5
+        assert_eq!(obj.len(), 5);
         assert!(!obj.contains_key("chat_template_kwargs"));
     }
 

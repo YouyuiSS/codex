@@ -7,6 +7,7 @@ use codex_client::StreamResponse;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::Stream;
 use futures::StreamExt;
@@ -87,11 +88,17 @@ pub async fn process_chat_sse<S>(
     let mut assistant_item: Option<ResponseItem> = None;
     let mut reasoning_item: Option<ResponseItem> = None;
     let mut completed_sent = false;
+    // OpenAI 协议：stream_options.include_usage=true 时 provider 在末尾 chunk
+    // 带 `usage` 字段（通常 choices=[]）。也有些 provider（DeepSeek 实测）会
+    // 在 finish_reason="stop" 同一个 chunk 里就附带 usage——所以每个 chunk
+    // 都试着提一次，保留最后一次非 None 的值。
+    let mut latest_token_usage: Option<TokenUsage> = None;
 
     async fn flush_and_complete(
         tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
         reasoning_item: &mut Option<ResponseItem>,
         assistant_item: &mut Option<ResponseItem>,
+        token_usage: Option<TokenUsage>,
     ) {
         if let Some(reasoning) = reasoning_item.take() {
             let _ = tx_event
@@ -108,7 +115,7 @@ pub async fn process_chat_sse<S>(
         let _ = tx_event
             .send(Ok(ResponseEvent::Completed {
                 response_id: String::new(),
-                token_usage: None,
+                token_usage,
                 end_turn: None,
             }))
             .await;
@@ -128,7 +135,13 @@ pub async fn process_chat_sse<S>(
             }
             Ok(None) => {
                 if !completed_sent {
-                    flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
+                    flush_and_complete(
+                        &tx_event,
+                        &mut reasoning_item,
+                        &mut assistant_item,
+                        latest_token_usage.take(),
+                    )
+                    .await;
                 }
                 return;
             }
@@ -150,7 +163,13 @@ pub async fn process_chat_sse<S>(
 
         if data == "[DONE]" || data == "DONE" {
             if !completed_sent {
-                flush_and_complete(&tx_event, &mut reasoning_item, &mut assistant_item).await;
+                flush_and_complete(
+                    &tx_event,
+                    &mut reasoning_item,
+                    &mut assistant_item,
+                    latest_token_usage.take(),
+                )
+                .await;
             }
             return;
         }
@@ -172,7 +191,16 @@ pub async fn process_chat_sse<S>(
             eprintln!("[chat-sse-trace] {data}");
         }
 
+        // 尝试从该 chunk 抽 usage 字段——OpenAI 协议要求最后一个 chunk 携带，
+        // 但部分 provider（DeepSeek 实测）会在 finish_reason="stop" 同一 chunk 上
+        // 就带 usage，所以每个 chunk 都试一次、保留最近一次非 None 的值。
+        if let Some(usage) = parse_chat_usage(value.get("usage")) {
+            latest_token_usage = Some(usage);
+        }
+
         let Some(choices) = value.get("choices").and_then(|c| c.as_array()) else {
+            // OpenAI 流式协议规定的"末尾 usage chunk"：choices=[]、只带 usage。
+            // 这一 chunk 已经在上面被 parse_chat_usage 吸收，不必继续。
             continue;
         };
 
@@ -283,6 +311,20 @@ pub async fn process_chat_sse<S>(
 
             let finish_reason = choice.get("finish_reason").and_then(|r| r.as_str());
             if finish_reason == Some("stop") {
+                // 只 flush items，**不**在这里 emit Completed。
+                //
+                // 原因：OpenAI 流式协议里 `usage` 出现在 finish_reason="stop" 之后
+                // 一个独立的 `choices=[]` chunk 上（紧跟 [DONE]）。如果在这里立刻
+                // emit Completed，codex_core 会在 [turn.rs ResponseEvent::Completed]
+                // 分支 break out of loop，后续的 usage chunk 永远到不了——auto-compact
+                // 阈值判定与 UI 占用展示就拿不到真值。
+                //
+                // 把 Completed 的 emit 让位给后面的 [DONE] / Ok(None) 路径
+                // （flush_and_complete），那时 latest_token_usage 已经填好。
+                //
+                // 兼容性：DeepSeek 实测会把 usage 直接放在 finish_reason="stop" 的
+                // 同一帧上——已经被前面 parse_chat_usage 抓走了，flush_and_complete
+                // 仍能拿到。两种 provider 行为都覆盖。
                 if let Some(reasoning) = reasoning_item.take() {
                     let _ = tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(reasoning)))
@@ -293,16 +335,6 @@ pub async fn process_chat_sse<S>(
                     let _ = tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(assistant)))
                         .await;
-                }
-                if !completed_sent {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id: String::new(),
-                            token_usage: None,
-                            end_turn: None,
-                        }))
-                        .await;
-                    completed_sent = true;
                 }
                 continue;
             }
@@ -345,6 +377,55 @@ pub async fn process_chat_sse<S>(
             }
         }
     }
+}
+
+/// 解析 OpenAI Chat Completions 协议的 `usage` 字段。
+///
+/// 字段映射（OpenAI 标准 + 实测 DeepSeek/GLM/Qwen 都按这套字段名给）：
+/// - `prompt_tokens`            → input_tokens
+/// - `completion_tokens`        → output_tokens
+/// - `total_tokens`             → total_tokens
+/// - `prompt_tokens_details.cached_tokens`        → cached_input_tokens（可选）
+/// - `completion_tokens_details.reasoning_tokens` → reasoning_output_tokens（可选）
+///
+/// 输入为 `Some(Value::Null)` / `None` / 非 object → 返回 `None`，调用方据此
+/// 跳过更新（保留之前的 latest_token_usage）。
+fn parse_chat_usage(value: Option<&serde_json::Value>) -> Option<TokenUsage> {
+    let usage = value?.as_object()?;
+    // OpenAI 协议要求 stream_options.include_usage=true 时，非终止 chunk 的
+    // usage 为 null；我们已经在上一层 unwrap_or(Value::Null) 取出来，看到的
+    // 是个 empty object / 完全没字段时，仍按 None 返回，避免写脏值。
+    let read = |key: &str| -> i64 {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let total_tokens = read("total_tokens");
+    let input_tokens = read("prompt_tokens");
+    let output_tokens = read("completion_tokens");
+    if total_tokens == 0 && input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    let cached_input_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("cached_tokens"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_output_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    Some(TokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    })
 }
 
 async fn append_assistant_text(
@@ -451,6 +532,83 @@ mod tests {
     async fn completes_on_done_sentinel_without_json() {
         let events = collect_events("event: message\ndata: [DONE]\n\n").await;
         assert_matches!(&events[..], [ResponseEvent::Completed { .. }]);
+    }
+
+    /// OpenAI 标准协议：finish_reason="stop" 之后单独发一个 `choices=[]` 的
+    /// usage chunk，然后 [DONE]。验证 Completed.token_usage 被填上。
+    #[tokio::test]
+    async fn captures_token_usage_from_trailing_usage_chunk() {
+        let delta = json!({ "choices": [{ "delta": { "content": "hi" } }] });
+        let stop = json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+        let usage = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1234,
+                "completion_tokens": 56,
+                "total_tokens": 1290,
+                "prompt_tokens_details": { "cached_tokens": 100 },
+                "completion_tokens_details": { "reasoning_tokens": 12 }
+            }
+        });
+        let mut body = build_body(&[delta, stop, usage]);
+        body.push_str("event: message\ndata: [DONE]\n\n");
+        let events = collect_events(&body).await;
+        let last = events.last().expect("at least one event");
+        assert_matches!(
+            last,
+            ResponseEvent::Completed {
+                token_usage: Some(usage),
+                ..
+            } if usage.total_tokens == 1290
+                && usage.input_tokens == 1234
+                && usage.output_tokens == 56
+                && usage.cached_input_tokens == 100
+                && usage.reasoning_output_tokens == 12
+        );
+    }
+
+    /// DeepSeek 实测：把 usage 直接挂在 finish_reason="stop" 的同一帧上。
+    #[tokio::test]
+    async fn captures_token_usage_from_finish_stop_frame() {
+        let delta = json!({ "choices": [{ "delta": { "content": "hi" } }] });
+        let stop_with_usage = json!({
+            "choices": [{ "delta": {}, "finish_reason": "stop" }],
+            "usage": {
+                "prompt_tokens": 200,
+                "completion_tokens": 10,
+                "total_tokens": 210
+            }
+        });
+        let mut body = build_body(&[delta, stop_with_usage]);
+        body.push_str("event: message\ndata: [DONE]\n\n");
+        let events = collect_events(&body).await;
+        let last = events.last().expect("at least one event");
+        assert_matches!(
+            last,
+            ResponseEvent::Completed {
+                token_usage: Some(usage),
+                ..
+            } if usage.total_tokens == 210
+                && usage.input_tokens == 200
+                && usage.output_tokens == 10
+        );
+    }
+
+    /// 向后兼容：provider 没遵循 stream_options.include_usage（旧的 mock /
+    /// 不支持的 OpenAI-compat 服务）→ Completed.token_usage 应该是 None，
+    /// 不应阻塞 stream 完成。
+    #[tokio::test]
+    async fn completes_with_none_usage_when_provider_omits_usage() {
+        let delta = json!({ "choices": [{ "delta": { "content": "hi" } }] });
+        let stop = json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] });
+        let mut body = build_body(&[delta, stop]);
+        body.push_str("event: message\ndata: [DONE]\n\n");
+        let events = collect_events(&body).await;
+        let last = events.last().expect("at least one event");
+        assert_matches!(
+            last,
+            ResponseEvent::Completed { token_usage: None, .. }
+        );
     }
 
     async fn collect_events(body: &str) -> Vec<ResponseEvent> {
