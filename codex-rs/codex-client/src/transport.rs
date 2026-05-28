@@ -110,43 +110,6 @@ fn header_value_for_trace<'a>(headers: &'a HeaderMap, name: http::header::Header
         .unwrap_or("<missing>")
 }
 
-/// codex-tea: 把 per-request 头部按 `name=value | name=value` 打成一行用于
-/// `[chat-http-trace] request headers ...` 落盘，方便对照 curl/Postman 看出
-/// 实际出站头部差异（504 / 鉴权 / 路由 等场景诊断）。
-///
-/// 注意三件**不在**这里的头部：
-/// - `User-Agent` / `originator`：reqwest::Client 全局 `default_headers`，由
-///   `codex-login/src/auth/default_client.rs::default_headers` 注入，值是
-///   `get_codex_user_agent()` + `originator().value`，本函数读不到。
-/// - `Content-Type: application/json`：在 `Request::prepare_body_for_send` 里
-///   按需补上，本函数读 `req.headers`（prepare 之前），所以也看不到。
-/// - `traceparent` / `tracestate`：在 `CodexRequestBuilder::send` 里通过 OTel
-///   TextMap propagator 注入，发送瞬间才有。
-///
-/// 上面三类是固定行为，定位 504 时按 default_client.rs 比对即可，这里只 dump
-/// 真正会逐请求变化的那部分头部。敏感字段值打掉，只保留长度。
-fn format_request_headers_for_trace(headers: &HeaderMap) -> String {
-    let mut pairs: Vec<String> = headers
-        .iter()
-        .map(|(name, value)| {
-            let name_str = name.as_str();
-            let lower = name_str.to_ascii_lowercase();
-            let is_sensitive = matches!(
-                lower.as_str(),
-                "authorization" | "cookie" | "x-api-key" | "api-key" | "x-auth-token"
-            );
-            let val_str = match value.to_str() {
-                Ok(s) if is_sensitive => format!("<masked len={}>", s.len()),
-                Ok(s) => s.to_string(),
-                Err(_) => "<non-utf8>".to_string(),
-            };
-            format!("{name_str}={val_str}")
-        })
-        .collect();
-    pairs.sort();
-    pairs.join(" | ")
-}
-
 fn text_content_chars(value: &Value) -> usize {
     match value {
         Value::String(text) => text.chars().count(),
@@ -263,10 +226,6 @@ impl HttpTransport for ReqwestTransport {
         let url = req.url.clone();
         let trace_chat_http = chat_http_trace_enabled();
         let trace_stats = trace_chat_http.then(|| request_stats_for_trace(&req));
-        // codex-tea: 用于诊断 504 / 鉴权 / 网关路由的"日志打头部"开关。
-        // 在 `self.build(req)` 把 req 消费掉之前，先把 per-request 头部 clone
-        // 出来，落盘到 sidecar.log。详见 format_request_headers_for_trace 注释。
-        let trace_headers = trace_chat_http.then(|| format_request_headers_for_trace(&req.headers));
         let builder = self.build(req)?;
         if trace_chat_http {
             if let Some(stats) = trace_stats.as_ref() {
@@ -281,9 +240,6 @@ impl HttpTransport for ReqwestTransport {
                 );
             } else {
                 eprintln!("[chat-http-trace] send start method={method} url={url}");
-            }
-            if let Some(headers_str) = trace_headers.as_deref() {
-                eprintln!("[chat-http-trace] request headers url={url} {headers_str}");
             }
         }
         let resp = match builder.send().await {
