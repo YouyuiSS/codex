@@ -26,6 +26,9 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     {
         model.supports_reasoning_summaries = true;
     }
+    if let Some(apply_patch_tool_type) = config.apply_patch_tool_type.clone() {
+        model.apply_patch_tool_type = Some(apply_patch_tool_type);
+    }
     if let Some(context_window) = config.model_context_window {
         model.context_window = Some(
             model

@@ -36,6 +36,7 @@ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
@@ -143,6 +144,14 @@ pub struct ConfigToml {
 
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
+
+    /// Force the apply_patch tool spec form (`freeform` / `function`) for the
+    /// configured model, overriding the model catalog. Desktop injects
+    /// `function` for chat-wire providers (DeepSeek/GLM/Qwen) whose unknown slug
+    /// would otherwise resolve to fallback metadata with `apply_patch_tool_type`
+    /// unset — leaving the model with no apply_patch tool and forcing it to edit
+    /// files via shell (PowerShell on Windows), which corrupts edits.
+    pub model_apply_patch_tool_type: Option<ApplyPatchToolType>,
 
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,

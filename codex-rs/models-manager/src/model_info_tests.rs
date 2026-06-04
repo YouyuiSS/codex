@@ -1,5 +1,6 @@
 use super::*;
 use crate::ModelsManagerConfig;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -66,6 +67,35 @@ fn model_context_window_uses_model_value_without_override() {
     let mut model = model_info_from_slug("unknown-model");
     model.context_window = Some(273_000);
     model.max_context_window = Some(400_000);
+    let config = ModelsManagerConfig::default();
+
+    let updated = with_config_overrides(model.clone(), &config);
+
+    assert_eq!(updated, model);
+}
+
+#[test]
+fn apply_patch_tool_type_override_forces_function() {
+    // Unknown (chat-wire custom) slugs fall back to metadata with
+    // apply_patch_tool_type unset; the override is what lets the desktop give
+    // them an apply_patch tool instead of forcing shell-based edits.
+    let model = model_info_from_slug("unknown-model");
+    assert_eq!(model.apply_patch_tool_type, None);
+    let config = ModelsManagerConfig {
+        apply_patch_tool_type: Some(ApplyPatchToolType::Function),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model.clone(), &config);
+    let mut expected = model;
+    expected.apply_patch_tool_type = Some(ApplyPatchToolType::Function);
+
+    assert_eq!(updated, expected);
+}
+
+#[test]
+fn apply_patch_tool_type_absent_override_is_noop() {
+    let model = model_info_from_slug("unknown-model");
     let config = ModelsManagerConfig::default();
 
     let updated = with_config_overrides(model.clone(), &config);
