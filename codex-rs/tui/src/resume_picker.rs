@@ -4,9 +4,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod transcript;
-
 use crate::app_server_session::AppServerSession;
+use crate::clipboard_paste::normalize_pasted_search_query;
 use crate::color::blend;
 use crate::color::is_light;
 use crate::git_action_directives::parse_assistant_markdown;
@@ -24,6 +23,9 @@ use crate::status::format_directory_display;
 use crate::terminal_palette::best_color;
 use crate::terminal_palette::default_bg;
 use crate::text_formatting::truncate_text;
+use crate::thread_transcript::RawReasoningVisibility;
+use crate::thread_transcript::TranscriptCells;
+use crate::thread_transcript::load_session_transcript;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
@@ -36,7 +38,6 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey;
-use codex_app_server_protocol::ThreadSourceKind;
 use codex_config::types::SessionPickerViewMode;
 use codex_protocol::ThreadId;
 use codex_utils_path as path_utils;
@@ -60,9 +61,6 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
-use transcript::RawReasoningVisibility;
-use transcript::TranscriptCells;
-use transcript::load_session_transcript;
 use unicode_width::UnicodeWidthStr;
 
 const PAGE_SIZE: usize = 25;
@@ -549,11 +547,6 @@ fn picker_cwd_filter(
     }
 }
 
-fn normalize_pasted_query(pasted: &str) -> Option<String> {
-    let normalized = pasted.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!normalized.is_empty()).then_some(normalized)
-}
-
 fn spawn_app_server_page_loader(
     app_server: AppServerSession,
     include_non_interactive: bool,
@@ -779,6 +772,7 @@ async fn load_transcript_preview(
         .thread_read(thread_id, /*include_turns*/ true)
         .await
         .map_err(std::io::Error::other)?;
+    let cwd = thread.cwd.as_path();
     let mut lines = thread
         .turns
         .iter()
@@ -799,7 +793,7 @@ async fn load_transcript_preview(
             }),
             ThreadItem::AgentMessage { text, .. } => Some(TranscriptPreviewLine {
                 speaker: TranscriptPreviewSpeaker::Assistant,
-                text: parse_assistant_markdown(text).visible_markdown,
+                text: parse_assistant_markdown(text, cwd).visible_markdown,
             }),
             _ => None,
         })
@@ -1160,23 +1154,21 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            _ if allow_plain_char_navigation && self.list_keymap.jump_top.is_pressed(key) => {
-                if !self.filtered_rows.is_empty() {
+            _ if allow_plain_char_navigation && self.list_keymap.jump_top.is_pressed(key)
+                && !self.filtered_rows.is_empty() => {
                     self.selected = 0;
                     self.ensure_selected_visible();
                     self.request_frame();
                 }
-            }
-            _ if allow_plain_char_navigation && self.list_keymap.jump_bottom.is_pressed(key) => {
-                if !self.filtered_rows.is_empty() {
+            _ if allow_plain_char_navigation && self.list_keymap.jump_bottom.is_pressed(key)
+                && !self.filtered_rows.is_empty() => {
                     self.selected = self.filtered_rows.len().saturating_sub(1);
                     self.ensure_selected_visible();
                     self.maybe_load_more_for_scroll();
                     self.request_frame();
                 }
-            }
-            _ if allow_plain_char_navigation && self.list_keymap.page_down.is_pressed(key) => {
-                if !self.filtered_rows.is_empty() {
+            _ if allow_plain_char_navigation && self.list_keymap.page_down.is_pressed(key)
+                && !self.filtered_rows.is_empty() => {
                     let step = self.view_rows.unwrap_or(10).max(1);
                     let target = self.selected.saturating_add(step);
                     let max_index = self.filtered_rows.len().saturating_sub(1);
@@ -1190,7 +1182,6 @@ impl PickerState {
                     }
                     self.request_frame();
                 }
-            }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
@@ -1223,16 +1214,15 @@ impl PickerState {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } => {
+            }
                 // basic text input for search
                 if !modifiers.contains(KeyModifiers::CONTROL)
                     && !modifiers.contains(KeyModifiers::ALT)
-                {
+                => {
                     let mut new_query = self.query.clone();
                     new_query.push(c);
                     self.set_query(new_query);
                 }
-            }
             _ => {}
         }
         Ok(None)
@@ -1242,7 +1232,7 @@ impl PickerState {
         if self.is_transcript_loading() {
             return;
         }
-        let Some(pasted) = normalize_pasted_query(&pasted) else {
+        let Some(pasted) = normalize_pasted_search_query(&pasted) else {
             return;
         };
         let mut new_query = self.query.clone();
@@ -1829,9 +1819,9 @@ fn thread_list_params(
             ProviderFilter::Any => None,
             ProviderFilter::MatchDefault(default_provider) => Some(vec![default_provider]),
         },
-        source_kinds: (!include_non_interactive)
-            .then_some(vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode]),
+        source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
         archived: Some(false),
+        parent_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
         use_state_db_only: false,
         search_term: None,
@@ -3207,6 +3197,7 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use codex_app_server_protocol::ThreadSourceKind;
     use codex_config::CONFIG_TOML_FILE;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -3572,7 +3563,8 @@ mod tests {
 
         assert_eq!(params.cursor, Some(String::from("cursor-1")));
         assert_eq!(params.model_providers, None);
-        assert_eq!(params.source_kinds, None);
+        let source_kinds = crate::resume_source_kinds(/*include_non_interactive*/ true);
+        assert_eq!(params.source_kinds, Some(source_kinds));
     }
 
     #[test]
@@ -5730,6 +5722,7 @@ session_picker_view = "dense"
             id: thread_id.to_string(),
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::from("remote thread"),
             ephemeral: false,
             model_provider: String::from("openai"),
@@ -5757,13 +5750,14 @@ session_picker_view = "dense"
 
     #[test]
     fn thread_to_transcript_cells_renders_core_message_types() {
-        use transcript::thread_to_transcript_cells;
+        use crate::thread_transcript::thread_to_transcript_cells;
 
         let thread_id = ThreadId::new();
         let thread = Thread {
             id: thread_id.to_string(),
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
             model_provider: String::from("openai"),
@@ -5785,6 +5779,7 @@ session_picker_view = "dense"
                 items: vec![
                     ThreadItem::UserMessage {
                         id: String::from("user-1"),
+                        client_id: None,
                         content: vec![codex_app_server_protocol::UserInput::Text {
                             text: String::from("hello from user"),
                             text_elements: Vec::new(),
@@ -5824,13 +5819,14 @@ session_picker_view = "dense"
 
     #[test]
     fn thread_to_transcript_cells_hides_raw_reasoning_when_not_enabled() {
-        use transcript::thread_to_transcript_cells;
+        use crate::thread_transcript::thread_to_transcript_cells;
 
         let thread_id = ThreadId::new();
         let thread = Thread {
             id: thread_id.to_string(),
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
             model_provider: String::from("openai"),
@@ -5881,13 +5877,14 @@ session_picker_view = "dense"
 
     #[test]
     fn thread_to_transcript_cells_shows_raw_reasoning_over_summary_when_enabled() {
-        use transcript::thread_to_transcript_cells;
+        use crate::thread_transcript::thread_to_transcript_cells;
 
         let thread_id = ThreadId::new();
         let thread = Thread {
             id: thread_id.to_string(),
             session_id: thread_id.to_string(),
             forked_from_id: None,
+            parent_thread_id: None,
             preview: String::from("preview"),
             ephemeral: false,
             model_provider: String::from("openai"),
@@ -6225,14 +6222,6 @@ session_picker_view = "dense"
         state.handle_paste(String::from("results"));
 
         assert_eq!(state.query, "resize results");
-    }
-
-    #[test]
-    fn normalize_pasted_query_collapses_whitespace() {
-        assert_eq!(
-            normalize_pasted_query("  alpha\n\tbeta\r\n gamma  "),
-            Some(String::from("alpha beta gamma"))
-        );
     }
 
     #[tokio::test]

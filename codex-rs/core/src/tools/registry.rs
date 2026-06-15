@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::function_tool::FunctionCallError;
-use crate::goals::GoalRuntimeEvent;
 use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
@@ -24,17 +23,17 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
-use crate::tools::tool_search_entry::ToolSearchInfo;
 use crate::util::error_or_panic;
 use codex_extension_api::ToolCallOutcome;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::EventMsg;
+use codex_rollout::state_db;
 use codex_tools::ToolName;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tracing::warn;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 
@@ -46,15 +45,17 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
-    fn search_info(&self) -> Option<ToolSearchInfo> {
-        None
-    }
-
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(
             payload,
             ToolPayload::Function { .. } | ToolPayload::ToolSearch { .. }
         )
+    }
+
+    /// Whether cancellation should let the handler finish teardown before the
+    /// host returns an aborted tool response.
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        false
     }
 
     fn telemetry_tags<'a>(
@@ -249,7 +250,6 @@ struct ExposureOverride {
     exposure: ToolExposure,
 }
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for ExposureOverride {
     fn tool_name(&self) -> ToolName {
         self.handler.tool_name()
@@ -267,21 +267,22 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
         self.exposure != ToolExposure::Hidden && self.handler.supports_parallel_tool_calls()
     }
 
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-        self.handler.handle(invocation).await
-    }
-}
-
-impl CoreToolRuntime for ExposureOverride {
     fn search_info(&self) -> Option<ToolSearchInfo> {
         self.handler.search_info()
     }
 
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        self.handler.handle(invocation)
+    }
+}
+
+impl CoreToolRuntime for ExposureOverride {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         self.handler.matches_kind(payload)
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.handler.waits_for_runtime_cancellation()
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -379,6 +380,11 @@ impl ToolRegistry {
     pub(crate) fn supports_parallel_tool_calls(&self, name: &ToolName) -> Option<bool> {
         let tool = self.tool(name)?;
         Some(tool.supports_parallel_tool_calls())
+    }
+
+    pub(crate) fn waits_for_runtime_cancellation(&self, name: &ToolName) -> Option<bool> {
+        let tool = self.tool(name)?;
+        Some(tool.waits_for_runtime_cancellation())
     }
 
     #[allow(dead_code)]
@@ -497,10 +503,12 @@ impl ToolRegistry {
                 PreToolUseHookResult::Blocked(message) => {
                     let err = FunctionCallError::RespondToModel(message);
                     dispatch_trace.record_failed(&err);
-                    if let Some(terminal_outcome_reached) = &terminal_outcome_reached {
-                        terminal_outcome_reached.store(true, Ordering::Release);
-                    }
-                    notify_tool_finish(&invocation, ToolCallOutcome::Blocked).await;
+                    notify_tool_finish_if_unclaimed(
+                        &invocation,
+                        terminal_outcome_reached.as_deref(),
+                        ToolCallOutcome::Blocked,
+                    )
+                    .await;
                     return Err(err);
                 }
                 PreToolUseHookResult::Continue {
@@ -511,11 +519,9 @@ impl ToolRegistry {
                     }
                     Err(err) => {
                         dispatch_trace.record_failed(&err);
-                        if let Some(terminal_outcome_reached) = &terminal_outcome_reached {
-                            terminal_outcome_reached.store(true, Ordering::Release);
-                        }
-                        notify_tool_finish(
+                        notify_tool_finish_if_unclaimed(
                             &invocation,
+                            terminal_outcome_reached.as_deref(),
                             ToolCallOutcome::Failed {
                                 handler_executed: false,
                             },
@@ -563,7 +569,7 @@ impl ToolRegistry {
             Ok((_, success)) => *success,
             Err(_) => false,
         };
-        emit_metric_for_tool_read(&invocation, success).await;
+        emit_metric_for_tool_read(&invocation, success);
         let post_tool_use_payload = if success {
             let guard = response_cell.lock().await;
             guard
@@ -588,7 +594,6 @@ impl ToolRegistry {
         } else {
             None
         };
-
         if let Some(outcome) = &post_tool_use_outcome {
             record_additional_contexts(
                 &invocation.session,
@@ -596,32 +601,9 @@ impl ToolRegistry {
                 outcome.additional_contexts.clone(),
             )
             .await;
-            let replacement_text = if outcome.should_stop {
-                Some(
-                    outcome
-                        .feedback_message
-                        .clone()
-                        .or_else(|| outcome.stop_reason.clone())
-                        .unwrap_or_else(|| "PostToolUse hook stopped execution".to_string()),
-                )
-            } else {
-                outcome.feedback_message.clone()
-            };
-            if let Some(replacement_text) = replacement_text {
-                let mut guard = response_cell.lock().await;
-                if let Some(mut result) = guard.take() {
-                    result.result = Box::new(PostToolUseFeedbackOutput {
-                        original: result.result,
-                        model_visible: FunctionToolOutput::from_text(
-                            replacement_text,
-                            /*success*/ None,
-                        ),
-                    });
-                    *guard = Some(result);
-                }
-            }
         }
 
+        // A PostToolUse block rejects the result, not the already-completed tool execution.
         let lifecycle_outcome = match &result {
             Ok(_) => {
                 let guard = response_cell.lock().await;
@@ -638,28 +620,38 @@ impl ToolRegistry {
                 handler_executed: true,
             },
         };
-        if let Some(terminal_outcome_reached) = &terminal_outcome_reached {
-            terminal_outcome_reached.store(true, Ordering::Release);
-        }
-        notify_tool_finish(&invocation, lifecycle_outcome).await;
-
-        if let Err(err) = invocation
-            .session
-            .goal_runtime_apply(GoalRuntimeEvent::ToolCompleted {
-                turn_context: invocation.turn.as_ref(),
-                tool_name: tool_name.name.as_str(),
-            })
-            .await
-        {
-            warn!("failed to account thread goal progress after tool call: {err}");
-        }
+        notify_tool_finish_if_unclaimed(
+            &invocation,
+            terminal_outcome_reached.as_deref(),
+            lifecycle_outcome,
+        )
+        .await;
 
         match result {
             Ok(_) => {
                 let mut guard = response_cell.lock().await;
-                let result = guard.take().ok_or_else(|| {
+                let mut result = guard.take().ok_or_else(|| {
                     FunctionCallError::Fatal("tool produced no output".to_string())
                 })?;
+                if let Some(outcome) = post_tool_use_outcome {
+                    if outcome.should_block {
+                        let message = outcome.feedback_message.unwrap_or_else(|| {
+                            "PostToolUse hook blocked the tool result".to_string()
+                        });
+                        let err = FunctionCallError::RespondToModel(message);
+                        dispatch_trace.record_failed(&err);
+                        return Err(err);
+                    }
+                    if let Some(feedback_message) = outcome.feedback_message {
+                        result.result = Box::new(PostToolUseFeedbackOutput {
+                            original: result.result,
+                            model_visible: FunctionToolOutput::from_text(
+                                feedback_message,
+                                /*success*/ None,
+                            ),
+                        });
+                    }
+                }
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,
@@ -676,6 +668,19 @@ impl ToolRegistry {
     }
 }
 
+async fn notify_tool_finish_if_unclaimed(
+    invocation: &ToolInvocation,
+    terminal_outcome_reached: Option<&AtomicBool>,
+    outcome: ToolCallOutcome,
+) -> bool {
+    if terminal_outcome_reached.is_some_and(|reached| reached.swap(true, Ordering::AcqRel)) {
+        return false;
+    }
+
+    notify_tool_finish(invocation, outcome).await;
+    true
+}
+
 async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
@@ -683,6 +688,16 @@ async fn handle_any_tool(
     let call_id = invocation.call_id.clone();
     let payload = invocation.payload.clone();
     let output = tool.handle(invocation.clone()).await?;
+    if output.contains_external_context()
+        && invocation.turn.config.memories.disable_on_external_context
+    {
+        state_db::mark_thread_memory_mode_polluted(
+            invocation.session.services.state_db.as_deref(),
+            invocation.session.thread_id,
+            "tool_output",
+        )
+        .await;
+    }
     let post_tool_use_payload =
         CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());
     Ok(AnyToolResult {

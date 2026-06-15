@@ -211,6 +211,7 @@ async fn perform_oauth_login_retry_without_scopes(
     name: &str,
     url: &str,
     store_mode: codex_config::types::OAuthCredentialsStoreMode,
+    keyring_backend_kind: codex_config::types::AuthKeyringBackendKind,
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
     resolved_scopes: &ResolvedMcpOAuthScopes,
@@ -223,6 +224,7 @@ async fn perform_oauth_login_retry_without_scopes(
         name,
         url,
         store_mode,
+        keyring_backend_kind,
         http_headers.clone(),
         env_http_headers.clone(),
         &resolved_scopes.scopes,
@@ -240,6 +242,7 @@ async fn perform_oauth_login_retry_without_scopes(
                 name,
                 url,
                 store_mode,
+                keyring_backend_kind,
                 http_headers,
                 env_http_headers,
                 &[],
@@ -384,6 +387,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
                 &name,
                 &oauth_config.url,
                 config.mcp_oauth_credentials_store_mode,
+                config.auth_keyring_backend_kind(),
                 oauth_config.http_headers,
                 oauth_config.env_http_headers,
                 &resolved_scopes,
@@ -478,6 +482,7 @@ async fn run_login(config_overrides: &CliConfigOverrides, login_args: LoginArgs)
         &name,
         &url,
         config.mcp_oauth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
         http_headers,
         env_http_headers,
         &resolved_scopes,
@@ -514,7 +519,12 @@ async fn run_logout(config_overrides: &CliConfigOverrides, logout_args: LogoutAr
         _ => bail!("OAuth logout is only supported for streamable_http transports."),
     };
 
-    match delete_oauth_tokens(&name, &url, config.mcp_oauth_credentials_store_mode) {
+    match delete_oauth_tokens(
+        &name,
+        &url,
+        config.mcp_oauth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
+    ) {
         Ok(true) => println!("Removed OAuth credentials for '{name}'."),
         Ok(false) => println!("No OAuth credentials stored for '{name}'."),
         Err(err) => return Err(anyhow!("failed to delete OAuth credentials: {err}")),
@@ -537,10 +547,11 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     let effective_mcp_servers = mcp_manager.effective_servers(&config, /*auth*/ None).await;
 
     let mut entries: Vec<_> = mcp_servers.iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(name, _)| *name);
     let auth_statuses = compute_auth_statuses(
         effective_mcp_servers.iter(),
         config.mcp_oauth_credentials_store_mode,
+        config.auth_keyring_backend_kind(),
         /*auth*/ None,
     )
     .await;
@@ -906,7 +917,7 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
             let headers_display = match http_headers {
                 Some(map) if !map.is_empty() => {
                     let mut pairs: Vec<_> = map.iter().collect();
-                    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    pairs.sort_by_key(|(name, _)| *name);
                     pairs
                         .into_iter()
                         .map(|(k, _)| format!("{k}=*****"))
@@ -919,7 +930,7 @@ async fn run_get(config_overrides: &CliConfigOverrides, get_args: GetArgs) -> Re
             let env_headers_display = match env_http_headers {
                 Some(map) if !map.is_empty() => {
                     let mut pairs: Vec<_> = map.iter().collect();
-                    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    pairs.sort_by_key(|(name, _)| *name);
                     pairs
                         .into_iter()
                         .map(|(k, var)| format!("{k}={var}"))

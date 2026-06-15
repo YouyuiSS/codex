@@ -15,12 +15,16 @@ use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
+use codex_config::loader::project_trust_key;
 use codex_features::FEATURES;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use serde_json::Value as JsonValue;
+use std::fmt::Display;
+use std::path::Path;
 use uuid::Uuid;
 
 pub(crate) fn replace_config_value(key_path: impl Into<String>, value: JsonValue) -> ConfigEdit {
@@ -38,6 +42,20 @@ pub(crate) fn clear_config_value(key_path: impl Into<String>) -> ConfigEdit {
 pub(crate) fn app_scoped_key_path(app_id: &str, key_path: &str) -> String {
     let app_id = serde_json::Value::String(app_id.to_string()).to_string();
     format!("apps.{app_id}.{key_path}")
+}
+
+pub(crate) fn format_config_error(err: &impl Display) -> String {
+    format!("{err:#}")
+}
+
+fn trusted_project_edit(project_path: &Path) -> ConfigEdit {
+    let project_key = project_trust_key(project_path)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    replace_config_value(
+        format!("projects.\"{project_key}\".trust_level"),
+        serde_json::json!(TrustLevel::Trusted.to_string()),
+    )
 }
 
 pub(crate) fn build_model_selection_edits(
@@ -122,6 +140,10 @@ pub(crate) fn build_memory_settings_edits(
     ]
 }
 
+pub(crate) fn build_oss_provider_edit(provider: &str) -> ConfigEdit {
+    replace_config_value("oss_provider", serde_json::json!(provider))
+}
+
 pub(crate) async fn write_config_batch(
     request_handle: AppServerRequestHandle,
     edits: Vec<ConfigEdit>,
@@ -139,6 +161,13 @@ pub(crate) async fn write_config_batch(
         })
         .await
         .wrap_err("config/batchWrite failed in TUI")
+}
+
+pub(crate) async fn write_trusted_project(
+    request_handle: AppServerRequestHandle,
+    project_path: &Path,
+) -> Result<ConfigWriteResponse> {
+    write_config_batch(request_handle, vec![trusted_project_edit(project_path)]).await
 }
 
 pub(crate) async fn read_effective_config(
@@ -179,15 +208,5 @@ pub(crate) async fn write_skill_enabled(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn app_scoped_key_path_quotes_dotted_app_ids() {
-        assert_eq!(
-            app_scoped_key_path("plugin.linear", "enabled"),
-            "apps.\"plugin.linear\".enabled"
-        );
-    }
-}
+#[path = "config_update_tests.rs"]
+mod tests;
