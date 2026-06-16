@@ -198,6 +198,7 @@ async fn build_model_tool_call_resolves_flat_chat_namespace_alias() -> anyhow::R
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     let call = router
@@ -207,6 +208,7 @@ async fn build_model_tool_call_resolves_flat_chat_namespace_alias() -> anyhow::R
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-flat-chat-namespace".to_string(),
+            metadata: None,
         })?
         .expect("function_call should produce a tool call");
 

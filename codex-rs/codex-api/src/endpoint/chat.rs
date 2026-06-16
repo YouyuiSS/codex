@@ -20,6 +20,7 @@ use crate::provider::Provider;
 use crate::requests::ChatRequest;
 use crate::sse::chat::spawn_chat_stream;
 use crate::telemetry::SseTelemetry;
+use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestTelemetry;
 use http::HeaderValue;
@@ -70,13 +71,18 @@ impl<T: HttpTransport> ChatClient<T> {
         )
     )]
     pub async fn stream_request(&self, request: ChatRequest) -> Result<ResponseStream, ApiError> {
+        // codex-tea drift: 上游 #28327 把 EndpointSession::stream_with 改名为
+        // stream_encoded_json_with，body 改收预编码的 EncodedJsonBody（一次编码、
+        // 重试时复用）。照上游 responses.rs 的做法先 encode 再传。
+        let body = EncodedJsonBody::encode(&request.body)
+            .map_err(|e| ApiError::Stream(format!("failed to encode chat request: {e}")))?;
         let stream_response = self
             .session
-            .stream_with(
+            .stream_encoded_json_with(
                 Method::POST,
                 "chat/completions",
                 request.headers,
-                Some(request.body),
+                Some(body),
                 |req| {
                     req.headers.insert(
                         http::header::ACCEPT,

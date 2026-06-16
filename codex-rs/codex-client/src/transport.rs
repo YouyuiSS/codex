@@ -110,7 +110,7 @@ fn chat_http_trace_enabled() -> bool {
         || std::env::var_os("TEA_CHAT_HTTP_TRACE").is_some()
 }
 
-fn header_value_for_trace<'a>(headers: &'a HeaderMap, name: http::header::HeaderName) -> &'a str {
+fn header_value_for_trace(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -141,26 +141,13 @@ fn request_stats_for_trace(req: &Request) -> ChatHttpTraceStats {
             stats.body_bytes = serde_json::to_vec(body)
                 .map(|bytes| bytes.len())
                 .unwrap_or(0);
-            stats.model = body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("<missing>")
-                .to_string();
-            stats.tools_count = body
-                .get("tools")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            if let Some(messages) = body.get("messages").and_then(Value::as_array) {
-                stats.messages_count = messages.len();
-                for message in messages {
-                    let content_chars = message.get("content").map(text_content_chars).unwrap_or(0);
-                    match message.get("role").and_then(Value::as_str) {
-                        Some("system" | "developer") => stats.system_chars += content_chars,
-                        Some("user") => stats.user_chars += content_chars,
-                        Some(_) | None => {}
-                    }
-                }
+            fill_chat_trace_stats_from_body(&mut stats, body);
+        }
+        Some(RequestBody::EncodedJson(body)) => {
+            let bytes = body.trace_bytes();
+            stats.body_bytes = bytes.len();
+            if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+                fill_chat_trace_stats_from_body(&mut stats, &value);
             }
         }
         Some(RequestBody::Raw(body)) => {
@@ -171,6 +158,30 @@ fn request_stats_for_trace(req: &Request) -> ChatHttpTraceStats {
     }
 
     stats
+}
+
+fn fill_chat_trace_stats_from_body(stats: &mut ChatHttpTraceStats, body: &Value) {
+    stats.model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string();
+    stats.tools_count = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        stats.messages_count = messages.len();
+        for message in messages {
+            let content_chars = message.get("content").map(text_content_chars).unwrap_or(0);
+            match message.get("role").and_then(Value::as_str) {
+                Some("system" | "developer") => stats.system_chars += content_chars,
+                Some("user") => stats.user_chars += content_chars,
+                Some(_) | None => {}
+            }
+        }
+    }
 }
 
 impl HttpTransport for ReqwestTransport {
@@ -303,16 +314,14 @@ impl HttpTransport for ReqwestTransport {
                     Ok(bytes) if !first_chunk_seen => {
                         first_chunk_seen = true;
                         eprintln!(
-                            "[chat-http-trace] first byte chunk url={} bytes={}",
-                            url_for_chunks,
+                            "[chat-http-trace] first byte chunk url={url_for_chunks} bytes={}",
                             bytes.len()
                         );
                     }
                     Ok(_) => {}
                     Err(err) => {
                         eprintln!(
-                            "[chat-http-trace] byte stream error url={} error={}",
-                            url_for_chunks, err
+                            "[chat-http-trace] byte stream error url={url_for_chunks} error={err}"
                         );
                     }
                 }

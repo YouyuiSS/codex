@@ -171,6 +171,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         startup_warnings: Vec::new(),
         bypass_hook_trust: false,
         model,
+        // codex-tea fork: chat-wire apply_patch 工具类型注入，sample 不需要。
+        model_apply_patch_tool_type: None,
         service_tier: None,
         review_model: None,
         model_context_window: None,

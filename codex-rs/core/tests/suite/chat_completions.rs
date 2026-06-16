@@ -28,8 +28,10 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
+use core_test_support::TestCodexResponsesRequestKind;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses::sse_response;
+use core_test_support::responses_metadata;
 use core_test_support::skip_if_no_network;
 use futures::StreamExt;
 use tempfile::TempDir;
@@ -91,7 +93,10 @@ async fn chat_completions_stream_translates_deltas_message_and_usage() {
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
-    let effort = config.model_reasoning_effort;
+    // codex-tea drift: 上游把 ReasoningEffort 改成非 Copy，直接读字段会部分
+    // 移动 config，后面 Arc::new(config) 报错，改用 clone。ReasoningSummary
+    // 仍是 Copy，按值读即可。
+    let effort = config.model_reasoning_effort.clone();
     let summary = config.model_reasoning_summary;
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
@@ -116,9 +121,7 @@ async fn chat_completions_stream_translates_deltas_message_and_usage() {
 
     let client = ModelClient::new(
         /*auth_manager*/ None,
-        thread_id.into(),
         thread_id,
-        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider.clone(),
         SessionSource::Exec,
         config.model_verbosity,
@@ -137,8 +140,23 @@ async fn chat_completions_stream_translates_deltas_message_and_usage() {
             text: "ping".into(),
         }],
         phase: None,
+        metadata: None,
     });
 
+    // codex-tea drift: 上游把 stream() 的 turn_metadata_header: Option<_> 改成
+    // responses_metadata: &CodexResponsesMetadata（#27122）。WireApi::Chat 臂会
+    // 丢弃该值，这里用 test helper 造一个有效引用即可。
+    let thread_id_str = thread_id.to_string();
+    let responses_metadata = responses_metadata(
+        "11111111-1111-4111-8111-111111111111",
+        &thread_id_str,
+        &thread_id_str,
+        /*turn_id*/ None,
+        /*window_id*/ "test-window".to_string(),
+        &SessionSource::Exec,
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
     let mut stream = client_session
         .stream(
             &prompt,
@@ -147,7 +165,7 @@ async fn chat_completions_stream_translates_deltas_message_and_usage() {
             effort,
             summary.unwrap_or(ReasoningSummary::Auto),
             /*service_tier*/ None,
-            /*turn_metadata_header*/ None,
+            &responses_metadata,
             &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await

@@ -110,10 +110,14 @@ impl<'a> ChatRequestBuilder<'a> {
                 ResponseItem::WebSearchCall { .. } => {}
                 ResponseItem::Compaction { .. } => {}
                 // codex-tea fork: 上游 #23xxx 后新增的 ResponseItem 变体——
-                // CompactionTrigger 是 unit marker（"此处触发了一次 compaction"），
-                // 对 chat-wire role 顺序判定无意义，与 Other/Compaction 同等待遇
-                // 一律忽略。
-                ResponseItem::CompactionTrigger => {}
+                // CompactionTrigger 标记"此处触发了一次 compaction"（#28355 后带
+                // 可选 metadata），对 chat-wire role 顺序判定无意义，与
+                // Other/Compaction 同等待遇一律忽略。
+                ResponseItem::CompactionTrigger { .. } => {}
+                // codex-tea fork: AgentMessage 是上游多 agent 运行时（#27830）的
+                // author→recipient 消息，不属于单 provider 的 user/assistant/tool
+                // 会话。chat-wire 路径不支持多 agent，忽略不影响 role 顺序判定。
+                ResponseItem::AgentMessage { .. } => {}
                 ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }
@@ -297,6 +301,7 @@ impl<'a> ChatRequestBuilder<'a> {
                     call_id: _,
                     status,
                     action,
+                    metadata: _,
                 } => {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
                     let tool_call = json!({
@@ -307,7 +312,11 @@ impl<'a> ChatRequestBuilder<'a> {
                     });
                     push_tool_call_message(&mut messages, tool_call, reasoning, reasoning_field);
                 }
-                ResponseItem::FunctionCallOutput { call_id, output } => {
+                ResponseItem::FunctionCallOutput {
+                    call_id,
+                    output,
+                    metadata: _,
+                } => {
                     // codex-tea drift: FunctionCallOutputPayload now exposes
                     // content_items() as a method and stores text in body.
                     let content_value = if let Some(items) = output.content_items() {
@@ -349,6 +358,7 @@ impl<'a> ChatRequestBuilder<'a> {
                     name,
                     input,
                     status: _,
+                    metadata: _,
                 } => {
                     let tool_call = json!({
                         "id": id,
@@ -374,7 +384,10 @@ impl<'a> ChatRequestBuilder<'a> {
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Other
                 | ResponseItem::Compaction { .. }
-                | ResponseItem::CompactionTrigger
+                | ResponseItem::CompactionTrigger { .. }
+                // codex-tea fork: 多 agent runtime（#27830）的 AgentMessage 在
+                // 单 provider chat-wire 路径上不可往返，与其它非会话项一并跳过。
+                | ResponseItem::AgentMessage { .. }
                 | ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }
@@ -566,6 +579,7 @@ mod tests {
                 text: "hi".to_string(),
             }],
             phase: None,
+            metadata: None,
         }];
         let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
             .conversation_id(Some("conv-1".into()))
@@ -596,6 +610,7 @@ mod tests {
                     text: "read these".to_string(),
                 }],
                 phase: None,
+                metadata: None,
             },
             ResponseItem::FunctionCall {
                 id: None,
@@ -603,6 +618,7 @@ mod tests {
                 namespace: None,
                 arguments: r#"{"path":"a.txt"}"#.to_string(),
                 call_id: "call-a".to_string(),
+                metadata: None,
             },
             ResponseItem::FunctionCall {
                 id: None,
@@ -610,6 +626,7 @@ mod tests {
                 namespace: None,
                 arguments: r#"{"path":"b.txt"}"#.to_string(),
                 call_id: "call-b".to_string(),
+                metadata: None,
             },
             ResponseItem::FunctionCall {
                 id: None,
@@ -617,6 +634,7 @@ mod tests {
                 namespace: None,
                 arguments: r#"{"path":"c.txt"}"#.to_string(),
                 call_id: "call-c".to_string(),
+                metadata: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-a".to_string(),
@@ -624,6 +642,7 @@ mod tests {
                     body: FunctionCallOutputBody::Text("A".to_string()),
                     success: None,
                 },
+                metadata: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-b".to_string(),
@@ -631,6 +650,7 @@ mod tests {
                     body: FunctionCallOutputBody::Text("B".to_string()),
                     success: None,
                 },
+                metadata: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-c".to_string(),
@@ -638,6 +658,7 @@ mod tests {
                     body: FunctionCallOutputBody::Text("C".to_string()),
                     success: None,
                 },
+                metadata: None,
             },
         ];
 
@@ -689,6 +710,7 @@ mod tests {
                 text: "hi".to_string(),
             }],
             phase: None,
+            metadata: None,
         }]
     }
 

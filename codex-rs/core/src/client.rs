@@ -1441,7 +1441,12 @@ impl ModelClientSession {
 
             // Build the chat-completions request body.
             let instructions = prompt.base_instructions.text.clone();
-            let input = prompt.get_formatted_input();
+            // codex-tea drift: 上游 #27246 把 get_formatted_input 改名为
+            // get_formatted_input_for_request(use_responses_lite)，lite=true 时
+            // 裁剪 image detail。responses-lite 是 Responses API 专属概念，
+            // chat-wire 不走它（图片由 ChatRequestBuilder 自己映射 image_url），
+            // 这里固定传 false。
+            let input = prompt.get_formatted_input_for_request(/*use_responses_lite*/ false);
             let tools = create_tools_json_for_chat_completions_api(&prompt.tools)
                 .map_err(|e| CodexErr::UnsupportedOperation(e.to_string()))?;
             let request = ChatRequestBuilder::new(&model_info.slug, &instructions, &input, &tools)
@@ -1816,7 +1821,7 @@ impl ModelClientSession {
                 // WebSocket transport; per-turn effort/summary/service_tier
                 // are also not part of the chat API surface (DeepSeek etc.
                 // expose plain `/v1/chat/completions`). Ignore those args.
-                let _ = (effort, summary, service_tier, turn_metadata_header);
+                let _ = (effort, summary, service_tier, responses_metadata);
                 self.stream_chat_completions(prompt, model_info, session_telemetry, inference_trace)
                     .await
             }
