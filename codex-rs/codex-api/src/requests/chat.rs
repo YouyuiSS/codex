@@ -3,6 +3,7 @@ use crate::provider::ChatDialect;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ReasoningItemContent;
@@ -114,10 +115,11 @@ impl<'a> ChatRequestBuilder<'a> {
                 // 可选 metadata），对 chat-wire role 顺序判定无意义，与
                 // Other/Compaction 同等待遇一律忽略。
                 ResponseItem::CompactionTrigger { .. } => {}
-                // codex-tea fork: AgentMessage 是上游多 agent 运行时（#27830）的
-                // author→recipient 消息，不属于单 provider 的 user/assistant/tool
-                // 会话。chat-wire 路径不支持多 agent，忽略不影响 role 顺序判定。
-                ResponseItem::AgentMessage { .. } => {}
+                ResponseItem::AgentMessage { content, .. } => {
+                    if agent_message_content_to_chat_text(content).is_some() {
+                        last_emitted_role = Some("assistant");
+                    }
+                }
                 ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }
@@ -380,14 +382,16 @@ impl<'a> ChatRequestBuilder<'a> {
                         "content": output,
                     }));
                 }
+                ResponseItem::AgentMessage { content, .. } => {
+                    if let Some(text) = agent_message_content_to_chat_text(content) {
+                        push_agent_message(&mut messages, text);
+                    }
+                }
                 ResponseItem::Reasoning { .. }
                 | ResponseItem::WebSearchCall { .. }
                 | ResponseItem::Other
                 | ResponseItem::Compaction { .. }
                 | ResponseItem::CompactionTrigger { .. }
-                // codex-tea fork: 多 agent runtime（#27830）的 AgentMessage 在
-                // 单 provider chat-wire 路径上不可往返，与其它非会话项一并跳过。
-                | ResponseItem::AgentMessage { .. }
                 | ResponseItem::ToolSearchCall { .. }
                 | ResponseItem::ToolSearchOutput { .. }
                 | ResponseItem::ImageGenerationCall { .. }
@@ -438,6 +442,37 @@ impl<'a> ChatRequestBuilder<'a> {
             headers,
         })
     }
+}
+
+fn agent_message_content_to_chat_text(content: &[AgentMessageInputContent]) -> Option<String> {
+    let mut text = String::new();
+    for item in content {
+        match item {
+            AgentMessageInputContent::InputText { text: segment } => text.push_str(segment),
+            AgentMessageInputContent::EncryptedContent { .. } => {}
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn push_agent_message(messages: &mut Vec<Value>, text: String) {
+    // Responses API 能把 `agent_message` 作为独立 typed item 传给模型；
+    // Chat Completions 只有 assistant/user/tool 角色，所以明文 agent 通知在
+    // chat-wire 上降级为 assistant commentary。加密 agent content 在进入这里前
+    // 已过滤：chat-wire 既不能解密，也不能 round-trip OpenAI opaque blob。
+    if let Some(Value::Object(prev_obj)) = messages.last_mut()
+        && prev_obj.get("role").and_then(Value::as_str) == Some("assistant")
+        && prev_obj.get("content").is_some_and(Value::is_null)
+        && prev_obj.get("tool_calls").is_some()
+    {
+        prev_obj.insert("content".to_string(), json!(text));
+        return;
+    }
+
+    messages.push(json!({
+        "role": "assistant",
+        "content": text,
+    }));
 }
 
 /// codex-tea fork: codex-rs 自己组装的 Chat Completions 顶层字段。
@@ -712,6 +747,73 @@ mod tests {
             phase: None,
             metadata: None,
         }]
+    }
+
+    #[test]
+    fn plaintext_agent_message_is_forwarded_as_assistant_chat_message() {
+        let mut prompt_input = minimal_prompt_input();
+        let notification = "<subagent_notification>\nchild done\n</subagent_notification>";
+        prompt_input.push(ResponseItem::AgentMessage {
+            author: "/root/worker".to_string(),
+            recipient: "/root".to_string(),
+            content: vec![AgentMessageInputContent::InputText {
+                text: notification.to_string(),
+            }],
+            metadata: None,
+        });
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        assert_eq!(
+            messages,
+            &vec![
+                json!({"role": "system", "content": "inst"}),
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": notification}),
+            ]
+        );
+    }
+
+    #[test]
+    fn encrypted_agent_message_is_omitted_from_chat_request() {
+        let mut prompt_input = minimal_prompt_input();
+        prompt_input.push(ResponseItem::AgentMessage {
+            author: "/root".to_string(),
+            recipient: "/root/worker".to_string(),
+            content: vec![AgentMessageInputContent::EncryptedContent {
+                encrypted_content: "opaque-encrypted-message".to_string(),
+            }],
+            metadata: None,
+        });
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(ChatDialect::Strict)
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        assert_eq!(
+            messages,
+            &vec![
+                json!({"role": "system", "content": "inst"}),
+                json!({"role": "user", "content": "hi"}),
+            ]
+        );
+        assert!(
+            !serde_json::to_string(&req.body)
+                .expect("chat request body should serialize")
+                .contains("opaque-encrypted-message")
+        );
     }
 
     #[test]

@@ -40,16 +40,35 @@ mod send_message;
 mod spawn;
 pub(crate) mod wait;
 
+#[derive(Clone, Copy)]
+pub(super) enum AgentMessageContentMode {
+    Encrypted,
+    Plaintext,
+}
+
 pub(super) fn communication_from_tool_message(
     author: AgentPath,
     recipient: AgentPath,
     message: String,
+    content_mode: AgentMessageContentMode,
 ) -> InterAgentCommunication {
-    InterAgentCommunication::new_encrypted(
-        author,
-        recipient,
-        Vec::new(),
-        message,
-        /*trigger_turn*/ true,
-    )
+    // Responses API 的 V2 多 agent 工具消息由服务端加密，必须走
+    // encrypted_content；Chat Completions 没有这条服务端加密通道，工具参数
+    // 本身就是模型产出的明文任务，因此要记录成 InputText，子 agent 才能读到。
+    match content_mode {
+        AgentMessageContentMode::Plaintext => InterAgentCommunication::new(
+            author,
+            recipient,
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        ),
+        AgentMessageContentMode::Encrypted => InterAgentCommunication::new_encrypted(
+            author,
+            recipient,
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        ),
+    }
 }

@@ -6,6 +6,7 @@
 use super::*;
 use crate::tools::context::FunctionToolOutput;
 use crate::turn_timing::now_unix_timestamp_ms;
+use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::InterAgentCommunication;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,8 +100,12 @@ pub(crate) async fn handle_message_string_tool(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
+    let content_mode = match turn.config.model_provider.wire_api {
+        WireApi::Chat => AgentMessageContentMode::Plaintext,
+        WireApi::Responses => AgentMessageContentMode::Encrypted,
+    };
     let communication =
-        communication_from_tool_message(author, receiver_agent_path.clone(), message);
+        communication_from_tool_message(author, receiver_agent_path.clone(), message, content_mode);
     let result = session
         .services
         .agent_control

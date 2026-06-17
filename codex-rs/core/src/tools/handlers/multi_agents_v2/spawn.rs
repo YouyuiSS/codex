@@ -7,6 +7,7 @@ use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::turn_timing::now_unix_timestamp_ms;
+use codex_model_provider_info::WireApi;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::Op;
 use codex_tools::ToolSpec;
@@ -117,8 +118,16 @@ async fn handle_spawn_agent(
                         .session_source
                         .get_agent_path()
                         .unwrap_or_else(AgentPath::root);
-                    let communication =
-                        communication_from_tool_message(author, new_agent_path.clone(), message);
+                    let content_mode = match turn.config.model_provider.wire_api {
+                        WireApi::Chat => AgentMessageContentMode::Plaintext,
+                        WireApi::Responses => AgentMessageContentMode::Encrypted,
+                    };
+                    let communication = communication_from_tool_message(
+                        author,
+                        new_agent_path.clone(),
+                        message,
+                        content_mode,
+                    );
                     Op::InterAgentCommunication { communication }
                 }
                 initial_operation => initial_operation,
